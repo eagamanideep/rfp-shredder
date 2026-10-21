@@ -23,7 +23,58 @@ from .shred import Shred, assign_ids
 from .shred_schema import SHOW_STOPPER_AREAS, TAB_BY_NAME, column_key
 
 DEFAULT_MODEL = "gpt-5.6-sol"
-MODELS = ("gpt-5.6-sol", "gpt-6.1-sol")
+MODELS = (
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.2",
+    "gpt-5.1",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+)
+
+# Standard-tier USD per 1M tokens: (input, cached input, output). Source: developers.openai.com/api/docs/pricing,
+# checked 2026-10-21. Keep in step with the model table in README.md.
+PRICES = {
+    "gpt-6.1-sol": (2.00, 0.10, 10.00),
+    "gpt-6-sol": (2.00, 0.20, 10.00),
+    "gpt-6-luna": (0.10, 0.01, 0.50),
+    "gpt-6-astra": (10.00, 1.00, 50.00),
+    "gpt-5.6-sol": (4.00, 0.40, 20.00),
+    "gpt-5.6-luna": (0.20, 0.02, 1.20),
+    "gpt-5.6-terra": (2.00, 0.20, 12.00),
+    "gpt-5.5": (5.00, 0.50, 30.00),
+    "gpt-5.4": (2.50, 0.25, 15.00),
+    "gpt-5.4-mini": (0.75, 0.075, 4.50),
+    "gpt-5.4-nano": (0.20, 0.02, 1.25),
+    "gpt-5.2": (1.75, 0.175, 14.00),
+    "gpt-5.1": (1.25, 0.125, 10.00),
+    "gpt-5": (1.25, 0.125, 10.00),
+    "gpt-5-mini": (0.25, 0.025, 2.00),
+    "gpt-5-nano": (0.05, 0.005, 0.40),
+}
+# Rates for a request whose input is over LONG_CONTEXT_TOKENS (only these models have a long-context tier).
+LONG_CONTEXT_TOKENS = 272_000
+LONG_CONTEXT_PRICES = {
+    "gpt-6.1-sol": (4.00, 0.20, 15.00),
+    "gpt-6-sol": (4.00, 0.40, 15.00),
+    "gpt-6-luna": (0.20, 0.02, 0.75),
+    "gpt-6-astra": (20.00, 2.00, 75.00),
+    "gpt-5.6-sol": (8.00, 0.80, 30.00),
+    "gpt-5.6-luna": (0.40, 0.04, 1.80),
+    "gpt-5.6-terra": (4.00, 0.40, 18.00),
+    "gpt-5.5": (10.00, 1.00, 45.00),
+    "gpt-5.4": (5.00, 0.50, 22.50),
+}
 
 SYSTEM_PROMPT = """You are a proposal "shred" analyst. You turn a procurement document (RFP/RFQ/IFB) into a
 source-grounded workbook for an internal proposal/pursuit team.
@@ -174,7 +225,7 @@ def build_ai_shred(
     report = progress or (lambda _f, _m: None)
 
     def run(names: tuple[str, ...], context: str, extra: dict | None = None) -> dict:
-        return _call(client, config, system, names, context, shred.run_date.isoformat(), extra)
+        return _call(client, config, system, names, context, shred.run_date.isoformat(), extra, usage=shred.usage)
 
     report(0.05, "Stage 1/3: requirements, key dates and opportunity details…")
     opportunity = {
@@ -275,7 +326,34 @@ def _tab_schema(name: str) -> dict:
     }
 
 
-def _call(client, config: AIConfig, system: str, names, context: str, run_date: str, extra=None) -> dict:
+def cost_usd(model: str, input_tokens: int, cached_tokens: int, output_tokens: int) -> float | None:
+    """Price of one request; None for a model without a known price. Output includes reasoning tokens."""
+    long_context = input_tokens > LONG_CONTEXT_TOKENS and model in LONG_CONTEXT_PRICES
+    prices = LONG_CONTEXT_PRICES[model] if long_context else PRICES.get(model)
+    if prices is None:
+        return None
+    price_in, price_cached, price_out = prices
+    return ((input_tokens - cached_tokens) * price_in + cached_tokens * price_cached + output_tokens * price_out) / 1e6
+
+
+def call_usage(model: str, step: str, usage) -> dict:
+    """Token counts and cost of one chat completion, from its `usage` block."""
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    output_details = getattr(usage, "completion_tokens_details", None)
+    cached = getattr(prompt_details, "cached_tokens", 0) or 0
+    return {
+        "step": step,
+        "input_tokens": usage.prompt_tokens,
+        "cached_input_tokens": cached,
+        "output_tokens": usage.completion_tokens,
+        "reasoning_tokens": getattr(output_details, "reasoning_tokens", 0) or 0,
+        "cost_usd": cost_usd(model, usage.prompt_tokens, cached, usage.completion_tokens),
+    }
+
+
+def _call(
+    client, config: AIConfig, system: str, names, context: str, run_date: str, extra=None, usage: list | None = None
+) -> dict:
     properties = {column_key(n): _tab_schema(n) for n in names}
     properties.update(extra or {})
     schema = {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
@@ -306,9 +384,12 @@ def _call(client, config: AIConfig, system: str, names, context: str, run_date: 
         },
         "max_completion_tokens": 32_000 if config.model.startswith("gpt-4") else 100_000,
     }
-    if config.model.startswith(("gpt-5", "o")):
+    if config.model.startswith(("gpt-5", "gpt-6", "o")):
         kwargs["reasoning_effort"] = config.reasoning_effort
     response = client.chat.completions.create(**kwargs)
+    # Record before the checks below: a cut-off or refused response is still billed.
+    if usage is not None and response.usage is not None:
+        usage.append(call_usage(config.model, ", ".join(names), response.usage))
     choice = response.choices[0]
     if choice.finish_reason == "length":
         raise ShredAIError("response was cut off at the output-token limit")

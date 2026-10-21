@@ -39,6 +39,8 @@ class Shred:
     title_overridden: bool = False
     # (step, seconds) in the order the steps ran.
     timings: list[tuple[str, float]] = field(default_factory=list)
+    # One dict per model call: step, token counts and cost (see shred_ai.call_usage).
+    usage: list[dict] = field(default_factory=list)
 
     @contextmanager
     def timed(self, step: str) -> Iterator[None]:

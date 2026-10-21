@@ -28,11 +28,40 @@ Two analysis modes:
 
 - **AI (OpenAI)** — fills every tab, including the judgement columns: risk levels, decision relevance,
   contradictions between pages, missing referenced sources, and cross-referenced IDs. Runs three stages of
-  structured-output calls with `gpt-5.6-sol` (default) or `gpt-6.1-sol`, selectable in the sidebar. Lower the
+  structured-output calls with `gpt-5.6-sol` (default) or another GPT-6 / GPT-5.x model selectable in the sidebar. Lower the
   reasoning effort to trade depth for speed. If one group of tabs fails, those tabs fall back to the
   rule-based rows and the app shows a warning.
 - **Rule-based** (no key, offline) — fills every tab by pattern matching: requirements, dates, Quick Turn, forms,
   submission rules, keyword-screened show stoppers and contract clauses. Judgement columns are marked for human review.
+
+### Models
+
+The sidebar offers these OpenAI models. All support Chat Completions with strict structured outputs and
+`reasoning_effort` (the app uses low / medium / high). Prices are standard tier, USD per 1M tokens, from the
+[OpenAI pricing page](https://developers.openai.com/api/docs/pricing) as of Oct 21, 2026. Cost figures in the app
+use the same prices ([`PRICES` in shred_ai.py](doc_to_excel/shred_ai.py)), so update both together.
+
+| Model | Input | Cached input | Output | Long context (>272K input): in / cached / out | Context window | Max output | Knowledge cutoff |
+|---|---|---|---|---|---|---|---|
+| `gpt-6.1-sol` | $2.00 | $0.10 | $10.00 | $4.00 / $0.20 / $15.00 | 1.05M | 128K | Apr 30, 2026 |
+| `gpt-6-sol` | $2.00 | $0.20 | $10.00 | $4.00 / $0.40 / $15.00 | 1.05M | 128K | Apr 20, 2026 |
+| `gpt-6-luna` | $0.10 | $0.01 | $0.50 | $0.20 / $0.02 / $0.75 | 1.05M | 128K | May 18, 2026 |
+| `gpt-6-astra` | $10.00 | $1.00 | $50.00 | $20.00 / $2.00 / $75.00 | 1.05M | 128K | Apr 30, 2026 |
+| `gpt-5.6-sol` (default) | $4.00 | $0.40 | $20.00 | $8.00 / $0.80 / $30.00 | 1.05M | 128K | Feb 16, 2026 |
+| `gpt-5.6-luna` | $0.20 | $0.02 | $1.20 | $0.40 / $0.04 / $1.80 | 1.05M | 128K | Feb 16, 2026 |
+| `gpt-5.6-terra` | $2.00 | $0.20 | $12.00 | $4.00 / $0.40 / $18.00 | 1.05M | 128K | Feb 16, 2026 |
+| `gpt-5.5` | $5.00 | $0.50 | $30.00 | $10.00 / $1.00 / $45.00 | 1.05M | 128K | Dec 1, 2025 |
+| `gpt-5.4` | $2.50 | $0.25 | $15.00 | $5.00 / $0.50 / $22.50 | 1.05M | 128K | Aug 31, 2025 |
+| `gpt-5.4-mini` | $0.75 | $0.075 | $4.50 | — | 400K | 128K | Aug 31, 2025 |
+| `gpt-5.4-nano` | $0.20 | $0.02 | $1.25 | — | 400K (272K max input) | 128K | Aug 31, 2025 |
+| `gpt-5.2` | $1.75 | $0.175 | $14.00 | — | 400K | 128K | Aug 31, 2025 |
+| `gpt-5.1` | $1.25 | $0.125 | $10.00 | — | 400K | 128K | Sep 30, 2024 |
+| `gpt-5` | $1.25 | $0.125 | $10.00 | — | 400K (272K max input) | 128K | Sep 30, 2024 |
+| `gpt-5-mini` | $0.25 | $0.025 | $2.00 | — | 400K | 128K | May 31, 2024 |
+| `gpt-5-nano` | $0.05 | $0.005 | $0.40 | — | 400K | 128K | May 31, 2024 |
+
+Reasoning tokens are billed as output. Every call in a run sends the whole document in the same system prompt,
+so after the first call most of the input is billed at the cached rate.
 
 **Contract Objections** are screened only against your internal *Contracts Proposal Objection Matrix* — upload it
 (`.xlsx`) in the sidebar. Without it, the tab says the terms were not screened.
@@ -64,11 +93,20 @@ python -m streamlit run app.py
 Open http://localhost:8501, upload the document, optionally fill in client / RFP number / title and the objection
 matrix, then click **Generate Full Shred** and **Download Full Shred workbook**.
 
-### Extraction times
+### Extraction times, cost and citations
 
-Every Full Shred run (app or benchmark) is appended to `runs/extraction_times.csv` (git-ignored) with the time for
-each step: read & extract, rule-based shred, AI stages 1–3, Excel build, and the total. The app shows the breakdown
-for the current run and the history of recorded runs.
+Every Full Shred run (app or benchmark) is appended to `runs/extraction_times.csv` (git-ignored) with:
+
+- the time for each step: read & extract, rule-based shred, AI stages 1–3, Excel build, and the total;
+- AI token usage summed over all model calls: `input_tokens` (of which `cached_input_tokens`), `output_tokens`
+  (of which `reasoning_tokens`), and `cost_usd` at the prices in the model table;
+- citation rate over every row of the tabs that have a Source Location column: `cited_rows` (cited / total),
+  `cited_pct` (rows with a non-empty Source Location) and `page_cited_pct` (rows citing a "p. N" page that exists
+  in the PDF; blank for other file types). These count whether a row says where it came from, not whether the
+  cited text says what the row claims. A tab that falls back to rule-based rows after an AI failure counts its
+  rule-based rows.
+
+The app shows these for the current run, a per-call token breakdown, and the history of recorded runs.
 
 To compare models on one document:
 
@@ -76,7 +114,8 @@ To compare models on one document:
 python benchmark.py "RFP.pdf" --models gpt-5.6-sol gpt-6.1-sol --effort medium
 ```
 
-Models run one after another so their timings don't compete; each workbook is saved to `runs/`. Use `rule` as a
+Models run one after another so their timings don't compete; each workbook is saved to `runs/`, and the tokens,
+cost and citation rate are printed per model. Use `rule` as a
 model name to time the rule-based pipeline.
 
 ### Tests

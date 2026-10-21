@@ -1,4 +1,4 @@
-"""Time Full Shred generation for one document across models and record it in runs/extraction_times.csv.
+"""Time and cost Full Shred generation for one document across models; record it in runs/extraction_times.csv.
 
 Usage:
     python benchmark.py RFP.pdf --models gpt-5.6-sol gpt-6.1-sol [--effort medium] [--out-dir runs]
@@ -67,13 +67,22 @@ def main() -> None:
             ai=ai,
             progress=lambda _f, message: print(f"  [{time.perf_counter() - start:6.0f}s] {message}", flush=True),
         )
-        record_run(shred, total, len(result.page_texts), "" if ai is None else model, args.effort)
+        row = record_run(shred, total, pages, "" if ai is None else model, args.effort)
         out = args.out_dir / f"{args.document.stem} - {model}.xlsx"
         out.write_bytes(workbook)
 
         for step, seconds in shred.timings:
             print(f"  {seconds:8.1f}s  {step}")
         print(f"  {total:8.1f}s  TOTAL ({len(shred.tabs['Compliance Matrix'])} requirements) -> {out.name}")
+        if shred.usage:
+            print(
+                f"  tokens: {row['input_tokens']} in ({row['cached_input_tokens']} cached), "
+                f"{row['output_tokens']} out ({row['reasoning_tokens']} reasoning); cost ${row['cost_usd'] or '?'}"
+            )
+        print(
+            f"  citations: {row['cited_rows']} rows ({row['cited_pct']}%), "
+            f"valid page cited: {row['page_cited_pct'] + '%' if row['page_cited_pct'] else 'n/a (not a PDF)'}"
+        )
         for warning in shred.warnings:
             print(f"  WARNING: {warning}")
 

@@ -25,7 +25,7 @@ from doc_to_excel import (
     extract_document,
 )
 from doc_to_excel.pipeline import generate_full_shred
-from doc_to_excel.run_log import LOG_PATH, load_runs, record_run
+from doc_to_excel.run_log import LOG_PATH, citation_stats, load_runs, record_run, usage_totals
 from doc_to_excel.shred import read_objection_matrix
 from doc_to_excel.shred_ai import DEFAULT_MODEL, MODELS, AIConfig
 from doc_to_excel.shred_schema import TABS
@@ -59,6 +59,40 @@ def show_timings(timings: list[tuple[str, float]], total: float) -> None:
         frame["Seconds"] = frame["Seconds"].round(2)
         st.dataframe(frame, hide_index=True, width="stretch")
         st.caption("Steps marked · are tab groups that run in parallel inside their stage, so they overlap.")
+
+
+def show_usage(shred, page_count: int | None) -> None:
+    """Cost, token counts and citation rate of the run, with a per-call breakdown."""
+    citations = citation_stats(shred, page_count)
+    cols = st.columns(4)
+    if shred.usage:
+        totals = usage_totals(shred)
+        cost = totals["cost_usd"]
+        cols[0].metric("Cost", "unknown" if cost is None else f"${cost:.4f}", help="Standard-tier OpenAI prices.")
+        cols[1].metric(
+            "Input tokens", f"{totals['input_tokens']:,}", help=f"{totals['cached_input_tokens']:,} served from cache"
+        )
+        cols[2].metric(
+            "Output tokens", f"{totals['output_tokens']:,}", help=f"{totals['reasoning_tokens']:,} of them reasoning"
+        )
+    else:
+        cols[0].metric("Cost", "$0 (rule-based)")
+    if citations["cited_pct"] is not None:
+        page_note = (
+            f"{citations['page_cited_pct']:.1f}% cite a page that exists in the document."
+            if citations["page_cited_pct"] is not None
+            else "Not a PDF, so page numbers are not checked."
+        )
+        cols[3].metric(
+            "Rows with a citation",
+            f"{citations['cited_pct']:.1f}%",
+            help=f"{citations['cited_rows']} of {citations['rows']} rows have a Source Location. {page_note}",
+        )
+    if shred.usage:
+        with st.expander(f"🪙 Token usage by model call ({len(shred.usage)} calls)"):
+            frame = pd.DataFrame(shred.usage)
+            frame["cost_usd"] = frame["cost_usd"].round(4)
+            st.dataframe(frame, hide_index=True, width="stretch")
 
 
 def format_seconds(seconds: float) -> str:
@@ -157,7 +191,8 @@ for warning in result.warnings:
     st.warning(warning)
 
 stem = PurePath(uploaded.name).stem
-pages = f"{len(result.page_texts)} pages" if result.file_type == "pdf" else result.file_type.upper()
+page_count = len(result.page_texts) if result.file_type == "pdf" else None
+pages = f"{page_count} pages" if page_count else result.file_type.upper()
 extract_step = (f"Read & extract document ({pages})" + (" (cached)" if cached else ""), extract_seconds)
 
 # ---------------------------------------------------------------- simple extract
@@ -217,7 +252,7 @@ if st.button(label, type="primary"):
     if bar:
         bar.empty()
     try:
-        record_run(shred, total, len(result.page_texts), model if use_ai else "", effort)
+        record_run(shred, total, page_count or result.file_type.upper(), model if use_ai else "", effort)
     except OSError as exc:
         st.warning(f"Could not record the run time in {LOG_PATH}: {exc}")
     st.session_state["shred"] = (run_key, shred, workbook, total)
@@ -237,6 +272,7 @@ for warning in shred.warnings:
 st.subheader(shred.title_suffix or stem)
 st.caption(f"{shred.mode} · {shred.opportunity_line()}")
 show_timings(shred.timings, total)
+show_usage(shred, page_count)
 
 stoppers = shred.tabs.get("Show Stoppers", [])
 cols = st.columns(5)
@@ -266,6 +302,6 @@ frame = pd.DataFrame(
 st.dataframe(frame, hide_index=True, width="stretch")
 
 if runs := load_runs():
-    with st.expander(f"📈 Recorded run times ({len(runs)} runs)"):
-        st.caption(f"Every Full Shred run is appended to {LOG_PATH}. Times are in seconds.")
+    with st.expander(f"📈 Recorded runs ({len(runs)})"):
+        st.caption(f"Every Full Shred run is appended to {LOG_PATH}. Times are in seconds, cost in USD.")
         st.dataframe(pd.DataFrame(runs[::-1]), hide_index=True, width="stretch")

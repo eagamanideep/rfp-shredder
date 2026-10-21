@@ -1,6 +1,8 @@
 import io
 from datetime import date
+from types import SimpleNamespace
 
+import pytest
 from openpyxl import load_workbook
 
 from doc_to_excel import extract_document, shred_ai
@@ -87,7 +89,7 @@ def test_ai_shred_replaces_tabs_and_falls_back_per_group(monkeypatch):
     result, base = rule_shred()
     rule_issue_log = list(base.tabs["Q&A + Issue Log"])
 
-    def fake_call(client, config, system, names, context, run_date, extra=None):
+    def fake_call(client, config, system, names, context, run_date, extra=None, usage=None):
         assert "PROCUREMENT DOCUMENT" in system and "Sealed bids" in system
         if "Show Stoppers" in names:
             raise RuntimeError("boom")
@@ -156,3 +158,86 @@ def test_run_log_records_stage_times(tmp_path):
     assert (rule["mode"], rule["model"], rule["read_extract_s"], rule["ai_stage1_s"]) == ("Rule-based", "", "1.50", "")
     assert (ai["mode"], ai["model"], ai["reasoning_effort"]) == ("AI", "gpt-6.1-sol", "high")
     assert ai["ai_stage2_s"] == "12.00"  # the parallel stage's wall-clock total, not one group
+
+
+def test_cost_uses_cached_and_long_context_rates():
+    # gpt-5.6-sol: $4 input, $0.40 cached, $20 output per 1M; over 272K input: $8 / $0.80 / $30.
+    assert shred_ai.cost_usd("gpt-5.6-sol", 100_000, 40_000, 10_000) == pytest.approx(0.24 + 0.016 + 0.2)
+    assert shred_ai.cost_usd("gpt-5.6-sol", 300_000, 0, 10_000) == pytest.approx(2.4 + 0.3)
+    assert shred_ai.cost_usd("gpt-5", 300_000, 0, 0) == pytest.approx(0.375)  # no long-context tier
+    assert shred_ai.cost_usd("unknown-model", 1, 0, 1) is None
+    assert set(shred_ai.PRICES) == set(shred_ai.MODELS)
+
+
+def test_call_records_usage_even_when_response_is_cut_off():
+    usage = SimpleNamespace(
+        prompt_tokens=1_000,
+        completion_tokens=500,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=200),
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=300),
+    )
+    message = SimpleNamespace(content="{}", refusal=None)
+    response = SimpleNamespace(usage=usage, choices=[SimpleNamespace(finish_reason="length", message=message)])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: response)))
+
+    recorded = []
+    with pytest.raises(shred_ai.ShredAIError):
+        shred_ai._call(client, AIConfig("sk-test"), "sys", ("Key Dates",), "", "2026-09-20", usage=recorded)
+    assert recorded == [
+        {
+            "step": "Key Dates",
+            "input_tokens": 1_000,
+            "cached_input_tokens": 200,
+            "output_tokens": 500,
+            "reasoning_tokens": 300,
+            "cost_usd": pytest.approx((800 * 4 + 200 * 0.4 + 500 * 20) / 1e6),
+        }
+    ]
+
+
+def test_run_log_records_usage_cost_and_citations(tmp_path):
+    from doc_to_excel.run_log import citation_stats, load_runs, record_run
+
+    _, shred = rule_shred()
+    for name in shred.tabs:
+        shred.tabs[name] = []
+    shred.tabs["Compliance Matrix"] = [
+        {"source_location": "p. 2, Section 1"},
+        {"source_location": "p. 9, Section 4"},  # page past the end of a 3-page document
+        {"source_location": "Entire document reviewed"},
+        {"source_location": ""},
+    ]
+    assert citation_stats(shred, 3) == {"rows": 4, "cited_rows": 3, "cited_pct": 75.0, "page_cited_pct": 25.0}
+    assert citation_stats(shred, None)["page_cited_pct"] is None
+
+    shred.usage = [
+        {
+            "step": "a",
+            "input_tokens": 10,
+            "cached_input_tokens": 4,
+            "output_tokens": 5,
+            "reasoning_tokens": 2,
+            "cost_usd": 0.5,
+        },
+        {
+            "step": "b",
+            "input_tokens": 20,
+            "cached_input_tokens": 0,
+            "output_tokens": 7,
+            "reasoning_tokens": 1,
+            "cost_usd": 0.25,
+        },
+    ]
+    log = tmp_path / "times.csv"
+    log.write_text("timestamp,file\n2026-01-01T00:00:00,old.pdf\n")  # a log from before the new columns
+    record_run(shred, 12.0, 3, model="gpt-5.6-sol", path=log)
+
+    old, new = load_runs(log)
+    assert old["file"] == "old.pdf" and old["cost_usd"] == ""
+    assert (new["input_tokens"], new["cached_input_tokens"], new["output_tokens"]) == ("30", "4", "12")
+    assert (new["cost_usd"], new["cited_rows"], new["cited_pct"], new["page_cited_pct"]) == (
+        "0.7500",
+        "3/4",
+        "75.0",
+        "25.0",
+    )
