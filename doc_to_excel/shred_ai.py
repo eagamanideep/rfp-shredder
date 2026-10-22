@@ -1,11 +1,25 @@
 """Fill the Full Shred with an OpenAI model, on top of the rule-based shred.
 
-Three stages, each a set of structured-output calls that share the same system prompt (instructions + the full
-document) so OpenAI's prompt cache serves the document after the first call:
+Two phases of parallel structured-output calls:
 
-1. Opportunity details, Compliance Matrix and Key Dates (later tabs cite their R-/KD- IDs).
-2. The topical tabs, in parallel.
-3. Show Stoppers, Shred Readiness and the Q&A + Issue Log, which summarise everything before them.
+A. Stages 1 and 2 run together.
+   1. Compliance Matrix, Key Dates and the screening tabs (Accessibility, Contract Vehicle, Supplier Diversity),
+      extracted from page chunks. The rows are merged in page order, each requirement's citation is checked against
+      the page text (see chunking.py), and a screening tab no chunk found anything for keeps its rule-based Not Found
+      row. Every chunk sees the document outline and the evaluation factors, so it can fill Evaluation Link.
+   2. The topical tabs, one call per tab, over the whole document. They leave their requirement-ID columns empty,
+      since the requirements do not exist yet.
+B. Stage 3 and the ID links run together.
+   3. Show Stoppers (split into parts of the fixed screening areas), Shred Readiness and the Q&A + Issue Log (split
+      by issue kind), summarising everything before them.
+   Link calls fill each topical tab's requirement-ID column from the finished Compliance Matrix. Requirements are
+   linked in code to the key dates and forms they mention (Related IDs).
+
+Columns that are the same on every row (Source File, Amendment / Version) are filled in code, not written by the
+model.
+
+Every call uses the same response schema (all tabs; a call fills only its own and returns [] for the rest). OpenAI's
+prompt cache covers the schema too, so a schema per call would stop the cache from serving the document.
 
 Any group that fails keeps its rule-based rows and adds a warning, so a run always produces a full workbook.
 """
@@ -13,11 +27,14 @@ Any group that fails keeps its rule-based rows and adds a warning, so a run alwa
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import date, datetime
 
+from .chunking import Chunk, check_citations, cited_pages, merge_chunk_rows, plan_chunks
 from .extract import ExtractionResult
 from .shred import Shred, assign_ids
 from .shred_schema import SHOW_STOPPER_AREAS, TAB_BY_NAME, column_key
@@ -82,7 +99,7 @@ source-grounded workbook for an internal proposal/pursuit team.
 Rules:
 - Ground every row in the document below. Never invent requirements, dates, quantities, names, or values.
 - Quote or closely paraphrase source language. Keep requirement text near-verbatim.
-- Source Location: "p. N, <section / heading>" (use the page markers). Source File: the file name given below.
+- Source Location: "p. N, <section / heading>" (use the page markers).
 - Make absences visible: where a tab screens for something the document does not contain, return an explicit
   "Not Found" row instead of an empty tab.
 - Flag contradictions and ambiguities instead of silently resolving them (e.g. a clause that conflicts with the
@@ -106,7 +123,7 @@ TAB_GUIDANCE = {
     "Notarization, Forms, Pricing, Insurance, Eligibility, Scope, Hardware, Performance, Contract Term, Invoicing, "
     "Evaluation, Award Rights...). Response / Artifact Needed is a short imperative. Workstream: Submission / "
     "Pricing / Forms / Legal / Eligibility / Narrative / Other. Evaluation Link names the evaluation factor and "
-    "weight it supports, if any. Amendment / Version: 'Baseline <RFP number>'. Include evaluation weights and "
+    "weight it supports, if any. Include evaluation weights and "
     "award/reservation-of-rights statements as Informational rows.",
     "Key Dates": "Every procurement date and deadline (questions, addenda, pre-bid, proposal due, withdrawal, "
     "award, contract term, post-award deliverables with relative timing). Do NOT add the shred run date row; it is "
@@ -157,19 +174,105 @@ TAB_GUIDANCE = {
     "clarification.",
 }
 
-STAGE2_GROUPS = (
-    ("Scope Summary", "Cost Breakdown", "Client Objectives"),
-    ("Proposal Outline", "Evaluation Summary", "Submission Mechanics", "Formatting + Limits"),
-    (
-        "Accessibility 508 ADA",
-        "Contract Vehicle Eligibility",
-        "Supplier Diversity Set-Aside",
-        "Work Samples + References",
-        "Forms + Attachments",
-    ),
-    ("Contract Objections", "Source Inventory", "Amendment + Delta Log"),
+SCREENING_TABS = ("Accessibility 508 ADA", "Contract Vehicle Eligibility", "Supplier Diversity Set-Aside")
+# Stage 1 calls per chunk: each tuple is one call.
+CHUNK_CALLS = (("Compliance Matrix",), ("Key Dates",), SCREENING_TABS)
+STAGE1_TABS = tuple(name for call in CHUNK_CALLS for name in call)
+STAGE2_TABS = (
+    "Scope Summary",
+    "Cost Breakdown",
+    "Client Objectives",
+    "Proposal Outline",
+    "Evaluation Summary",
+    "Submission Mechanics",
+    "Formatting + Limits",
+    "Work Samples + References",
+    "Forms + Attachments",
+    "Contract Objections",
+    "Source Inventory",
+    "Amendment + Delta Log",
 )
 STAGE3_GROUP = ("Show Stoppers", "Shred Readiness", "Q&A + Issue Log")
+AI_TABS = STAGE1_TABS + STAGE2_TABS + STAGE3_GROUP
+
+# Per-model defaults, from benchmarks on a 31-page RFP: gpt-5-nano at medium effort spent ~80% of its output on
+# reasoning and repeated rows, so it gets low effort and smaller chunks. Other models use the fallbacks; for
+# gpt-6-luna, 6,000-character chunks cost ~2 points of grounding and ~4 of recall against 9,000.
+MODEL_SETTINGS = {
+    "gpt-5-nano": {"reasoning_effort": "low", "chunk_chars": 6000},
+}
+DEFAULT_EFFORT = "medium"
+DEFAULT_CHUNK_CHARS = 9000
+
+
+def default_effort(model: str) -> str:
+    return MODEL_SETTINGS.get(model, {}).get("reasoning_effort", DEFAULT_EFFORT)
+
+
+def default_chunk_chars(model: str) -> int:
+    return MODEL_SETTINGS.get(model, {}).get("chunk_chars", DEFAULT_CHUNK_CHARS)
+
+
+CHUNK_RULES = """
+You are given ONE EXCERPT of the document (the pages named in the task), plus the document outline for orientation.
+- Return rows only for content that begins on the excerpt's own pages, and cite pages inside the excerpt.
+- Text marked CONTEXT ONLY belongs to the next excerpt: read it to complete a row, never return rows that begin there.
+- Leave Related IDs empty; they are linked later.
+- Evaluation Link: when a row clearly supports one of the EVALUATION FACTORS below, name that factor and its weight;
+  otherwise leave it empty.
+- Screening tabs (Accessibility 508 ADA, Contract Vehicle Eligibility, Supplier Diversity Set-Aside): return rows only
+  for matching content in the excerpt, and an empty array when there is none. Never return Not Found rows for them;
+  absence across the whole document is recorded later.
+"""
+SCHEMA_NAME = "full_shred"
+
+# Columns filled in code (same value on every row), so the model does not spend output tokens on them.
+CODE_FILLED = {"source_file"}
+CODE_FILLED_BY_TAB = {"Compliance Matrix": {"amendment_version"}}
+# Requirement-ID columns of the tabs built before the Compliance Matrix exists, filled by link calls.
+LINKED_COLUMNS = {
+    "Proposal Outline": "requirement_ids",
+    "Evaluation Summary": "related_requirement_ids",
+    "Submission Mechanics": "related_requirement_ids",
+    "Formatting + Limits": "related_requirement_ids",
+    "Work Samples + References": "related_requirement_ids",
+    "Forms + Attachments": "related_requirement_ids",
+    "Contract Objections": "related_requirement_ids",
+    "Accessibility 508 ADA": "related_requirement_ids",
+    "Contract Vehicle Eligibility": "related_requirement_ids",
+    "Supplier Diversity Set-Aside": "related_requirement_ids",
+}
+STAGE2_RULE = (
+    "The Compliance Matrix is built in parallel with this call: leave Requirement IDs / Related Requirement IDs "
+    "empty; they are linked afterwards."
+)
+SHOW_STOPPER_PARTS = 3
+ISSUE_LOG_PARTS = (
+    "Cover ONLY contradictions (between pages, sections or tabs) and missing or referenced-but-unsupplied sources.",
+    "Cover ONLY ambiguities and open questions that need a clarification; contradictions and missing sources are "
+    "logged by a separate call.",
+)
+LINK_PROMPT = """You link rows of a proposal shred to the requirements they relate to.
+For each row given, return the IDs of the Compliance Matrix requirements (R-NNN) that the row is about, supports,
+or depends on: most relevant first, at most 6, comma-separated. Use only IDs from the Compliance Matrix below. Return
+an empty string when no requirement relates. Return one entry per row, using the row's ID.
+"""
+LINK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "links": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}, "requirement_ids": {"type": "string"}},
+                "required": ["id", "requirement_ids"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["links"],
+    "additionalProperties": False,
+}
 
 
 class ShredAIError(RuntimeError):
@@ -182,7 +285,11 @@ class AIConfig:
     model: str = DEFAULT_MODEL
     organization: str | None = None
     project: str | None = None
-    reasoning_effort: str = "medium"
+    reasoning_effort: str = DEFAULT_EFFORT
+    # Stage 1 reads the document in chunks of about this many characters; 0 reads it whole, None uses the
+    # model's default (MODEL_SETTINGS).
+    chunk_chars: int | None = None
+    max_parallel: int = 48
 
 
 def document_text(result: ExtractionResult) -> str:
@@ -211,7 +318,8 @@ def build_ai_shred(
         api_key=config.api_key,
         organization=config.organization or None,
         project=config.project or None,
-        timeout=900,
+        # Calls are short now (the slowest ~90 s); a stalled request is cut off and retried instead of waiting 15 min.
+        timeout=300,
         max_retries=2,
     )
     system = (
@@ -224,37 +332,49 @@ def build_ai_shred(
     shred.warnings = [w for w in shred.warnings if not w.startswith("Rule-based shred")]
     report = progress or (lambda _f, _m: None)
 
-    def run(names: tuple[str, ...], context: str, extra: dict | None = None) -> dict:
-        return _call(client, config, system, names, context, shred.run_date.isoformat(), extra, usage=shred.usage)
+    def run(names: tuple[str, ...], context: str, note: str = "", areas: range | None = None) -> dict:
+        date = shred.run_date.isoformat()
+        return _call(client, config, system, names, context, date, usage=shred.usage, note=note, areas=areas)
 
-    report(0.05, "Stage 1/3: requirements, key dates and opportunity details…")
-    opportunity = {
-        "type": "object",
-        "properties": {k: {"type": "string"} for k in ("client", "rfp_number", "title")},
-        "required": ["client", "rfp_number", "title"],
-        "additionalProperties": False,
-    }
-    try:
-        with shred.timed("AI stage 1 · Compliance Matrix, Key Dates"):
-            data = run(("Compliance Matrix", "Key Dates"), "", {"opportunity": opportunity})
-        opp = data["opportunity"]
-        shred.client = shred.client if base.client_overridden else (opp["client"] or shred.client)
-        shred.rfp_number = shred.rfp_number if base.rfp_overridden else (opp["rfp_number"] or shred.rfp_number)
-        shred.title = shred.title if base.title_overridden else (opp["title"] or shred.title)
-        shred.tabs["Compliance Matrix"] = data["compliance_matrix"]
-        shred.tabs["Key Dates"] = shred.tabs["Key Dates"][:1] + data["key_dates"]
-        assign_ids(shred.tabs, ["Compliance Matrix", "Key Dates"])
-    except Exception as exc:  # noqa: BLE001 - keep the rule-based rows and report the failure
-        shred.warnings.append(f"AI stage 1 failed ({exc}); requirements and dates are rule-based.")
+    chunks = plan_chunks(
+        result, default_chunk_chars(config.model) if config.chunk_chars is None else config.chunk_chars
+    )
+    chunk_system = (
+        f"{SYSTEM_PROMPT}{CHUNK_RULES}\nSource file name: {base.source_file}\n\n"
+        f"===== DOCUMENT OUTLINE =====\n{_outline(result)}\n\n"
+        f"===== EVALUATION FACTORS =====\n{_evaluation_factors(base)}"
+    )
 
-    context = _summary(shred, ("Compliance Matrix", "Key Dates"))
-    report(0.35, "Stage 2/3: scope, pricing, outline, forms, contract screening…")
-    _run_groups(shred, "AI stage 2", STAGE2_GROUPS, lambda names: run(names, context))
+    def run_chunk(names: tuple[str, ...], i: int) -> dict:
+        chunk = chunks[i]
+        excerpt = f"\n===== EXCERPT: {chunk.label} =====\n{chunk.text}"
+        date = shred.run_date.isoformat()
+        # The first chunk holds the cover page, so its Key Dates call also reads the opportunity details.
+        opportunity = names == ("Key Dates",) and i == 0
+        return _call(client, config, chunk_system, names, "", date, opportunity, usage=shred.usage, excerpt=excerpt)
 
-    report(0.75, "Stage 3/3: show stoppers, readiness and issue log…")
+    rule_show_stoppers = list(shred.tabs.get("Show Stoppers", []))
+    report(0.05, f"Stages 1-2: requirements from {len(chunks)} page chunks, and the topical tabs…")
+    start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stage1 = pool.submit(_run_stage1, shred, result, chunks, run_chunk, config.max_parallel)
+        stage2 = pool.submit(
+            _run_groups,
+            shred,
+            "AI stage 2",
+            tuple((n,) for n in STAGE2_TABS),
+            lambda names: run(names, "", STAGE2_RULE),
+        )
+        stage1.result(), stage2.result()
+    shred.timings.append(("AI stages 1+2 total (run together)", time.perf_counter() - start))
+    _fill_code_columns(shred)
+    _link_related_ids(shred)
+
+    report(0.6, "Stage 3: show stoppers, readiness, issue log, and requirement links…")
     context = _summary(shred, [n for n in shred.tabs if n not in STAGE3_GROUP])
-    _run_groups(shred, "AI stage 3", (STAGE3_GROUP,), lambda names: run(names, context))
-    _pin_show_stoppers(shred)
+    _run_stage3(shred, run, context, lambda tab: _link_call(client, config, shred, tab))
+    _pin_show_stoppers(shred, rule_show_stoppers)
+    _fill_code_columns(shred)
 
     readiness = next(iter(shred.tabs.get("Shred Readiness", [])), {})
     if readiness:
@@ -264,7 +384,156 @@ def build_ai_shred(
     return shred
 
 
+def _run_stage1(shred: Shred, result: ExtractionResult, chunks: list[Chunk], run_chunk, max_parallel: int) -> None:
+    """Extract the stage-1 tabs chunk by chunk in parallel, then merge and check them.
+
+    A failed chunk keeps the rule-based rows that cite its pages, so the tab still covers the whole document.
+    """
+    rule_rows = {name: list(shred.tabs.get(name, [])) for name in STAGE1_TABS}
+    jobs = [(names, i) for i in range(len(chunks)) for names in CHUNK_CALLS]
+
+    def timed_call(job):
+        start = time.perf_counter()
+        try:
+            return run_chunk(*job), None, time.perf_counter() - start
+        except Exception as exc:  # noqa: BLE001 - keep the rule-based rows and report the failure
+            return None, exc, time.perf_counter() - start
+
+    start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=max(1, min(max_parallel, len(jobs)))) as pool:
+        futures = {job: pool.submit(timed_call, job) for job in jobs}
+    elapsed = time.perf_counter() - start
+
+    rows = {name: [[] for _ in chunks] for name in STAGE1_TABS}
+    for (names, i), future in futures.items():
+        data, exc, seconds = future.result()
+        chunk = chunks[i]
+        label = "Screening" if names == SCREENING_TABS else names[0]
+        shred.timings.append((f"AI stage 1 · {label} · {chunk.label}", seconds))
+        if exc is None:
+            for name in names:
+                rows[name][i] = data[column_key(name)]
+            opportunity = data.get("opportunity") or {}
+            if opportunity.get("client") or opportunity.get("title"):
+                _apply_opportunity(shred, opportunity)
+            continue
+        for name in names:
+            rows[name][i] = [
+                r
+                for r in rule_rows[name][1 if name == "Key Dates" else 0 :]
+                if any(chunk.first_page <= p <= chunk.last_page for p in cited_pages(r.get("source_location"), 10**6))
+            ]
+        shred.warnings.append(f"AI failed for {label}, {chunk.label} ({exc}); those pages use rule-based rows.")
+    shred.timings.append(("AI stage 1 total (chunks run in parallel)", elapsed))
+
+    for name in SCREENING_TABS:
+        keys = TAB_BY_NAME[name].keys
+        # Models return "Not Found" rows per chunk despite the instructions; absence is decided here instead.
+        matches = [[r for r in chunk_rows if _is_finding(r, keys)] for chunk_rows in rows[name]]
+        found = merge_chunk_rows(matches, lambda r, k=keys: " ".join(str(r.get(x, "")) for x in k[:2]), chunks)
+        # Nothing found in any chunk: the rule-based rows stand (a Not Found row, or keyword hits marked for review).
+        shred.tabs[name] = found or rule_rows[name]
+
+    requirements = merge_chunk_rows(rows["Compliance Matrix"], lambda r: str(r.get("requirement_text", "")), chunks)
+    checks = check_citations(requirements, result, "requirement_text")
+    if checks["unverified"]:
+        shred.warnings.append(
+            f"{checks['unverified']} of {checks['checked']} requirements could not be found on their cited page; "
+            "they are marked Unverified in Notes."
+        )
+    shred.tabs["Compliance Matrix"] = requirements
+    dates = merge_chunk_rows(
+        rows["Key Dates"], lambda r: " ".join(str(r.get(k, "")) for k in ("date_type", "date", "time")), chunks
+    )
+    for row in dates:
+        _normalize_date(row, shred.run_date)
+    # KD-001 is the rule-based shred run date row; the model's rows follow it.
+    shred.tabs["Key Dates"] = rule_rows["Key Dates"][:1] + dates
+    assign_ids(shred.tabs, list(STAGE1_TABS))
+
+
+def _is_finding(row: dict, keys: tuple[str, ...]) -> bool:
+    """A screening row that reports something found, not an absence ("Not Found") or an empty row."""
+    lead = " ".join(str(row.get(k) or "") for k in keys[:2]).strip()
+    return bool(lead) and "not found" not in f"{lead} {row.get('notes') or ''}".lower()
+
+
+DATE_FORMATS = ("%b %d, %Y", "%B %d, %Y", "%b. %d, %Y", "%Y-%m-%d", "%m/%d/%Y")
+DATE_IN_TEXT = re.compile(r"\b[A-Z][a-z]{2,8}\.? \d{1,2}, \d{4}\b")
+
+
+def _parse_date(text: str) -> date | None:
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(text.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _normalize_date(row: dict, run_date: date) -> None:
+    """Write a parseable date as "Mon D, YYYY" and compute its days from the run date (models slip on both)."""
+    parsed = _parse_date(str(row.get("date", "")))
+    if parsed:
+        row["date"] = f"{parsed:%b} {parsed.day}, {parsed.year}"
+        row["calendar_days_from_shred_run"] = str((parsed - run_date).days)
+
+
+def _normalized(text) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).split())
+
+
+def _link_related_ids(shred: Shred, limit: int = 6) -> None:
+    """Fill an empty Related IDs cell with the key dates a requirement states and the forms it names.
+
+    Chunk calls cannot see each other's IDs, so this is done in code: a key date matches when the requirement text
+    contains that date; a form matches when the requirement text contains the form's name (before any parenthesis).
+    """
+    dates = [(r["id"], _parse_date(str(r.get("date", "")))) for r in shred.tabs.get("Key Dates", [])[1:]]
+    forms = [
+        (r["id"], name)
+        for r in shred.tabs.get("Forms + Attachments", [])
+        if len(name := _normalized(str(r.get("form_attachment", "")).split("(")[0])) >= 6
+    ]
+    for row in shred.tabs.get("Compliance Matrix", []):
+        if row.get("related_ids"):
+            continue
+        text = str(row.get("requirement_text", ""))
+        stated = {_parse_date(d) for d in DATE_IN_TEXT.findall(text)} - {None}
+        words = f" {_normalized(text)} "
+        ids = [i for i, d in dates if d and d in stated] + [i for i, name in forms if f" {name} " in words]
+        row["related_ids"] = ", ".join(dict.fromkeys(ids[:limit]))
+
+
+def _evaluation_factors(shred: Shred) -> str:
+    """The evaluation factors and weights the rule-based shred found, for chunk calls to fill Evaluation Link."""
+    lines = [
+        f"- {r.get('criterion_factor')}" + (f" ({r['weight_points']})" if r.get("weight_points") else "")
+        for r in shred.tabs.get("Evaluation Summary", [])
+        if r.get("criterion_factor")
+    ]
+    return "\n".join(lines) or "(none detected; leave Evaluation Link empty unless the excerpt names a factor)"
+
+
+def _apply_opportunity(shred: Shred, opp: dict) -> None:
+    shred.client = shred.client if shred.client_overridden else (opp.get("client") or shred.client)
+    shred.rfp_number = shred.rfp_number if shred.rfp_overridden else (opp.get("rfp_number") or shred.rfp_number)
+    shred.title = shred.title if shred.title_overridden else (opp.get("title") or shred.title)
+
+
+def _outline(result: ExtractionResult) -> str:
+    """Top two heading levels with their pages, so a chunk call knows where its excerpt sits."""
+    lines = [
+        f"{'  ' * (s.level - 1)}{s.heading[:100]}" + (f" (p. {s.page})" if s.page else "")
+        for s in result.sections
+        if s.level <= 2
+    ]
+    return "\n".join(lines) or "(no headings detected)"
+
+
 def _run_groups(shred: Shred, stage: str, groups, call) -> None:
+    """Run each group's call in parallel and store one list of rows per tab."""
+
     def timed_call(names):
         start = time.perf_counter()
         try:
@@ -283,19 +552,141 @@ def _run_groups(shred: Shred, stage: str, groups, call) -> None:
             shred.warnings.append(f"AI failed for {', '.join(names)} ({exc}); those tabs are rule-based.")
             continue
         for name in names:
-            shred.tabs[name] = data[column_key(name)]
+            if data[column_key(name)]:
+                shred.tabs[name] = data[column_key(name)]
+            else:
+                # The prompt asks for explicit Not Found rows, so an empty tab means the call did not do the work.
+                shred.warnings.append(f"AI returned no rows for {name}; that tab is rule-based.")
         assign_ids(shred.tabs, list(names))
     if len(groups) > 1:
         shred.timings.append((f"{stage} total (groups run in parallel)", elapsed))
 
 
-def _pin_show_stoppers(shred: Shred) -> None:
-    """Show Stoppers has fixed rows: force the area names/order whatever the model returned."""
+def _run_stage3(shred: Shred, run, context: str, link) -> None:
+    """Show Stoppers in parts, Shred Readiness, the issue log by issue kind, and the link calls, all in parallel.
+
+    A split tab is assembled from its parts in order (the issue log without repeats). A failed or empty part is
+    reported; the tab keeps its rule-based rows only when no part returned rows.
+    """
+    size = -(-len(SHOW_STOPPER_AREAS) // SHOW_STOPPER_PARTS)
+    jobs = {
+        f"Show Stoppers {i + 1}/{SHOW_STOPPER_PARTS}": (
+            "Show Stoppers",
+            lambda a=range(i * size, min((i + 1) * size, len(SHOW_STOPPER_AREAS))): run(
+                ("Show Stoppers",), context, areas=a
+            ),
+        )
+        for i in range(SHOW_STOPPER_PARTS)
+    }
+    jobs["Shred Readiness"] = ("Shred Readiness", lambda: run(("Shred Readiness",), context))
+    for i, note in enumerate(ISSUE_LOG_PARTS):
+        jobs[f"Q&A + Issue Log {i + 1}/{len(ISSUE_LOG_PARTS)}"] = (
+            "Q&A + Issue Log",
+            lambda n=note: run(("Q&A + Issue Log",), context, n),
+        )
+    for tab in LINKED_COLUMNS:
+        if shred.tabs.get(tab):
+            jobs[f"Links · {tab}"] = (None, lambda t=tab: link(t))
+
+    def timed_call(fn):
+        start = time.perf_counter()
+        try:
+            return fn(), None, time.perf_counter() - start
+        except Exception as exc:  # noqa: BLE001 - keep the rule-based rows and report the failure
+            return None, exc, time.perf_counter() - start
+
+    start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = {label: pool.submit(timed_call, fn) for label, (_, fn) in jobs.items()}
+    elapsed = time.perf_counter() - start
+
+    parts: dict[str, list[list[dict]]] = {name: [] for name in STAGE3_GROUP}
+    for label, future in futures.items():
+        data, exc, seconds = future.result()
+        tab = jobs[label][0]
+        shred.timings.append((f"AI stage 3 · {label}", seconds))
+        if exc is not None:
+            shred.warnings.append(
+                f"AI failed for {label} ({exc}); " + ("rule-based rows fill in." if tab else "links left empty.")
+            )
+        elif tab:
+            parts[tab].append(data[column_key(tab)])
+            if not data[column_key(tab)]:
+                shred.warnings.append(f"AI returned no rows for {label}.")
+    shred.timings.append(("AI stage 3 total (groups run in parallel)", elapsed))
+
+    for tab, chunks in parts.items():
+        rows = (
+            merge_chunk_rows(chunks, lambda r: str(r.get("question_conflict", "")))
+            if tab == "Q&A + Issue Log"
+            else [r for part in chunks for r in part]
+        )
+        if rows:
+            shred.tabs[tab] = rows
+        elif chunks:
+            shred.warnings.append(f"AI returned no rows for {tab}; that tab is rule-based.")
+        assign_ids(shred.tabs, [tab])
+
+
+def _link_call(client, config: AIConfig, shred: Shred, tab: str) -> None:
+    """Fill one tab's requirement-ID column from the Compliance Matrix (only IDs that exist are kept)."""
+    column = LINKED_COLUMNS[tab]
+    requirements = shred.tabs.get("Compliance Matrix", [])
+    known = {r["id"] for r in requirements}
+    matrix = "\n".join(
+        f"{r['id']}: {str(r.get('requirement_text', ''))[:200]} [{r.get('source_location', '')}]" for r in requirements
+    )
+    spec = TAB_BY_NAME[tab]
+    rows = "\n".join(
+        f"{r['id']}: "
+        + " | ".join(
+            str(r.get(k, ""))[:160] for k in spec.keys if r.get(k) and k not in (column, "source_file", "notes")
+        )
+        for r in shred.tabs[tab]
+    )
+    system = f"{LINK_PROMPT}\n===== COMPLIANCE MATRIX =====\n{matrix}"
+    user = f"Tab: {tab}\nRows:\n{rows}"
+    links: dict[str, list[str]] = {}
+    for _attempt in range(2):
+        data = _request(client, config, system, user, "requirement_links", LINK_SCHEMA, f"Links · {tab}", shred.usage)
+        by_id = {link["id"]: link["requirement_ids"] for link in data["links"]}
+        links = {
+            r["id"]: [i for i in re.findall(r"R-\d{3,}", by_id.get(r["id"], "")) if i in known] for r in shred.tabs[tab]
+        }
+        # No link at all for a tab with real rows is a silent failure (seen once for Forms + Attachments): retry once.
+        if any(links.values()) or len(shred.tabs[tab]) < 3:
+            break
+    else:
+        raise ShredAIError("the link call returned no requirement IDs for any row")
+    for row in shred.tabs[tab]:
+        row[column] = ", ".join(dict.fromkeys(links[row["id"]][:6]))
+
+
+def _fill_code_columns(shred: Shred) -> None:
+    """Fill the columns the model is not asked for (CODE_FILLED); rule-based rows already have them."""
+    for name in AI_TABS:
+        for row in shred.tabs.get(name, []):
+            if "source_file" in TAB_BY_NAME[name].keys:
+                row.setdefault("source_file", shred.source_file)
+    for row in shred.tabs.get("Compliance Matrix", []):
+        row.setdefault("amendment_version", f"Baseline {shred.rfp_number}".strip())
+
+
+def _pin_show_stoppers(shred: Shred, rule_rows: list[dict] | None = None) -> None:
+    """Show Stoppers has fixed rows: force the area names/order; an area no part returned keeps its rule-based row."""
     rows = shred.tabs.get("Show Stoppers", [])
     by_area = {r.get("screening_area", "").lower(): r for r in rows}
+    by_rule = {r.get("screening_area", "").lower(): r for r in rule_rows or []}
+    # By position only when every area came back, so a reworded area name still lands on its own row.
+    complete = len(rows) == len(SHOW_STOPPER_AREAS)
     pinned = []
     for i, (area, kind) in enumerate(SHOW_STOPPER_AREAS):
-        row = by_area.get(area.lower()) or (rows[i] if i < len(rows) else {"finding_status": "Unclear"})
+        row = (
+            by_area.get(area.lower())
+            or (rows[i] if complete else None)
+            or by_rule.get(area.lower())
+            or {"finding_status": "Unclear"}
+        )
         pinned.append({**row, "screening_area": area, "screening_type": kind})
     shred.tabs["Show Stoppers"] = pinned
     assign_ids(shred.tabs, ["Show Stoppers"])
@@ -313,8 +704,13 @@ def _summary(shred: Shred, names) -> str:
     return "\n".join(lines)
 
 
+def _model_keys(name: str) -> list[str]:
+    skip = CODE_FILLED | CODE_FILLED_BY_TAB.get(name, set())
+    return [k for k in TAB_BY_NAME[name].keys if k not in skip]
+
+
 def _tab_schema(name: str) -> dict:
-    keys = list(TAB_BY_NAME[name].keys)
+    keys = _model_keys(name)
     return {
         "type": "array",
         "items": {
@@ -351,36 +747,75 @@ def call_usage(model: str, step: str, usage) -> dict:
     }
 
 
-def _call(
-    client, config: AIConfig, system: str, names, context: str, run_date: str, extra=None, usage: list | None = None
-) -> dict:
-    properties = {column_key(n): _tab_schema(n) for n in names}
-    properties.update(extra or {})
-    schema = {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
+def shared_schema() -> dict:
+    """One schema for every call: all AI tabs plus the opportunity details."""
+    properties = {column_key(n): _tab_schema(n) for n in AI_TABS}
+    properties["opportunity"] = {
+        "type": "object",
+        "properties": {k: {"type": "string"} for k in ("client", "rfp_number", "title")},
+        "required": ["client", "rfp_number", "title"],
+        "additionalProperties": False,
+    }
+    return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
 
-    task = [f"Shred run date: {run_date}.", "Produce these tabs:"]
+
+def _call(
+    client,
+    config: AIConfig,
+    system: str,
+    names,
+    context: str,
+    run_date: str,
+    opportunity: bool = False,
+    usage: list | None = None,
+    excerpt: str = "",
+    note: str = "",
+    areas: range | None = None,
+) -> dict:
+    task = [
+        f"Shred run date: {run_date}.",
+        "Produce ONLY these tabs; return an empty array for every other tab in the schema:",
+    ]
     for name in names:
         spec = TAB_BY_NAME[name]
+        headers = [h for h, k in zip(spec.headers, spec.keys, strict=True) if k in _model_keys(name)]
         task.append(
-            f"\n### {name} (IDs {spec.prefix}-NNN)\nPurpose: {spec.purpose}\nColumns: {', '.join(spec.headers)}"
+            f"\n### {name} (IDs {spec.prefix}-NNN)\nPurpose: {spec.purpose}\nColumns: {', '.join(headers)}"
             f"\n{TAB_GUIDANCE.get(name, '')}"
         )
         if name == "Show Stoppers":
+            picked = areas if areas is not None else range(len(SHOW_STOPPER_AREAS))
             task.append(
-                "Fixed screening areas, in order:\n"
-                + "\n".join(f"{i}. {a} ({t})" for i, (a, t) in enumerate(SHOW_STOPPER_AREAS, start=1))
+                (
+                    "Fixed screening areas, in order:\n"
+                    if areas is None
+                    else "Return rows ONLY for these screening areas, in order:\n"
+                )
+                + "\n".join(f"{i + 1}. {SHOW_STOPPER_AREAS[i][0]} ({SHOW_STOPPER_AREAS[i][1]})" for i in picked)
             )
-    if extra and "opportunity" in extra:
+    if note:
+        task.append(f"\n{note}")
+    if opportunity:
         task.append("\nAlso return `opportunity`: issuing organisation (client), solicitation number, and title.")
+    else:
+        task.append("\nReturn empty strings in `opportunity`.")
     if context:
         task.append(f"\n===== TABS ALREADY BUILT (cite these IDs) =====\n{context}")
+    if excerpt:
+        task.append(excerpt)
 
+    return _request(client, config, system, "\n".join(task), SCHEMA_NAME, _SHARED_SCHEMA, ", ".join(names), usage)
+
+
+def _request(
+    client, config: AIConfig, system: str, user: str, schema_name: str, schema: dict, step: str, usage
+) -> dict:
     kwargs = {
         "model": config.model,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": "\n".join(task)}],
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": column_key("_".join(names))[:60], "strict": True, "schema": schema},
+            "json_schema": {"name": schema_name, "strict": True, "schema": schema},
         },
         "max_completion_tokens": 32_000 if config.model.startswith("gpt-4") else 100_000,
     }
@@ -389,10 +824,13 @@ def _call(
     response = client.chat.completions.create(**kwargs)
     # Record before the checks below: a cut-off or refused response is still billed.
     if usage is not None and response.usage is not None:
-        usage.append(call_usage(config.model, ", ".join(names), response.usage))
+        usage.append(call_usage(config.model, step, response.usage))
     choice = response.choices[0]
     if choice.finish_reason == "length":
         raise ShredAIError("response was cut off at the output-token limit")
     if getattr(choice.message, "refusal", None):
         raise ShredAIError(f"model refused: {choice.message.refusal}")
     return json.loads(choice.message.content)
+
+
+_SHARED_SCHEMA = shared_schema()

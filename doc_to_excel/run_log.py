@@ -98,10 +98,10 @@ def record_run(
         "requirements": str(len(shred.tabs.get("Compliance Matrix", []))),
         "read_extract_s": _seconds(shred, "Read & extract"),
         "rule_shred_s": _seconds(shred, "Rule-based shred"),
-        "ai_stage1_s": _seconds(shred, "AI stage 1"),
-        # Stage 2 runs its groups in parallel: its wall-clock total is the stage time.
+        # Each stage runs its groups in parallel: its wall-clock total is the stage time.
+        "ai_stage1_s": _seconds(shred, "AI stage 1 total", "AI stage 1"),
         "ai_stage2_s": _seconds(shred, "AI stage 2 total", "AI stage 2"),
-        "ai_stage3_s": _seconds(shred, "AI stage 3"),
+        "ai_stage3_s": _seconds(shred, "AI stage 3 total", "AI stage 3"),
         "build_excel_s": _seconds(shred, "Build Excel workbook"),
         "total_s": f"{total:.2f}",
         "warnings": str(len(shred.warnings)),

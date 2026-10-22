@@ -27,7 +27,7 @@ from doc_to_excel import (
 from doc_to_excel.pipeline import generate_full_shred
 from doc_to_excel.run_log import LOG_PATH, citation_stats, load_runs, record_run, usage_totals
 from doc_to_excel.shred import read_objection_matrix
-from doc_to_excel.shred_ai import DEFAULT_MODEL, MODELS, AIConfig
+from doc_to_excel.shred_ai import DEFAULT_MODEL, MODELS, AIConfig, default_effort
 from doc_to_excel.shred_schema import TABS
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -130,8 +130,9 @@ with st.sidebar:
         effort = st.select_slider(
             "Reasoning effort",
             ("low", "medium", "high"),
-            value="medium",
+            value=default_effort(model),
             disabled=not use_ai or model.startswith("gpt-4"),
+            help="Starts at the recommended setting for the model.",
         )
 
         st.header("Opportunity")

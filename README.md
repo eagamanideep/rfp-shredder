@@ -27,10 +27,26 @@ rows carry a stable ID and trace back to source file, page and section.
 Two analysis modes:
 
 - **AI (OpenAI)** — fills every tab, including the judgement columns: risk levels, decision relevance,
-  contradictions between pages, missing referenced sources, and cross-referenced IDs. Runs three stages of
-  structured-output calls with `gpt-5.6-sol` (default) or another GPT-6 / GPT-5.x model selectable in the sidebar. Lower the
-  reasoning effort to trade depth for speed. If one group of tabs fails, those tabs fall back to the
-  rule-based rows and the app shows a warning.
+  contradictions between pages, missing referenced sources, and cross-referenced IDs. Uses `gpt-5.6-sol`
+  (default) or another GPT-6 / GPT-5.x model selectable in the sidebar, in two phases of parallel
+  structured-output calls. Stages 1 and 2 run at the same time, then stage 3 and the ID links:
+  1. **Compliance Matrix, Key Dates and the screening tabs** (Accessibility, Contract Vehicle, Supplier
+     Diversity), extracted from section-aligned page chunks. Every chunk sees the document outline and the
+     evaluation factors, so requirements carry their Evaluation Link. The rows are merged in page order without
+     repeats, each requirement's text is checked against the page it cites (the page is corrected, or the row is
+     marked *Unverified* in Notes), and dates are normalised. A screening tab with no match in any chunk keeps the
+     rule-based Not Found row.
+  2. **The topical tabs**, one call per tab over the whole document.
+  3. **Show Stoppers** (in three parts of the fixed screening areas), **Shred Readiness** and the **Q&A + Issue
+     Log** (one call for contradictions and missing sources, one for other open questions), summarising
+     everything before them. Alongside them, a short link call per topical tab fills its requirement-ID column
+     from the finished Compliance Matrix (only IDs that exist are kept), and requirements are linked in code to
+     the key dates they state and the forms they name.
+
+  Source File and Amendment / Version are the same on every row, so they are filled in code rather than written
+  by the model. Each model has a recommended reasoning effort and chunk size (`MODEL_SETTINGS` in
+  [shred_ai.py](doc_to_excel/shred_ai.py); `gpt-5-nano` uses low effort and smaller chunks). If a call fails or
+  returns an empty tab, that tab (or those pages) keeps the rule-based rows and the app shows a warning.
 - **Rule-based** (no key, offline) — fills every tab by pattern matching: requirements, dates, Quick Turn, forms,
   submission rules, keyword-screened show stoppers and contract clauses. Judgement columns are marked for human review.
 
@@ -60,8 +76,9 @@ use the same prices ([`PRICES` in shred_ai.py](doc_to_excel/shred_ai.py)), so up
 | `gpt-5-mini` | $0.25 | $0.025 | $2.00 | — | 400K | 128K | May 31, 2024 |
 | `gpt-5-nano` | $0.05 | $0.005 | $0.40 | — | 400K | 128K | May 31, 2024 |
 
-Reasoning tokens are billed as output. Every call in a run sends the whole document in the same system prompt,
-so after the first call most of the input is billed at the cached rate.
+Reasoning tokens are billed as output. Every call uses the same response schema and, within a stage, the same
+system prompt, so OpenAI's prompt cache serves the repeated part (a different schema per call would defeat it).
+In benchmarks about half of all input tokens were billed at the cached rate.
 
 **Contract Objections** are screened only against your internal *Contracts Proposal Objection Matrix* — upload it
 (`.xlsx`) in the sidebar. Without it, the tab says the terms were not screened.
@@ -111,12 +128,14 @@ The app shows these for the current run, a per-call token breakdown, and the his
 To compare models on one document:
 
 ```bash
-python benchmark.py "RFP.pdf" --models gpt-5.6-sol gpt-6.1-sol --effort medium
+python benchmark.py "RFP.pdf" --models gpt-6-luna gpt-5-nano
 ```
 
 Models run one after another so their timings don't compete; each workbook is saved to `runs/`, and the tokens,
-cost and citation rate are printed per model. Use `rule` as a
-model name to time the rule-based pipeline.
+cost and citation rate are printed per model. `--effort` and `--chunk-chars` override the model's recommended
+settings (`--chunk-chars 0` reads the document whole). Use `rule` as a model name to time the rule-based pipeline.
+
+Further speed, cost and quality work is listed in [docs/optimisation-backlog.md](docs/optimisation-backlog.md).
 
 ### Tests
 
