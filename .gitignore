@@ -6,3 +6,4 @@ __pycache__/
 .streamlit/secrets.toml
 .env
 runs/
+rfp_docs/rfp-1.pdf
