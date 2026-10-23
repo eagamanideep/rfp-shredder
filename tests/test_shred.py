@@ -99,7 +99,7 @@ def test_ai_shred_replaces_tabs_and_falls_back_per_group(monkeypatch):
         chunk_call = names in shred_ai.CHUNK_CALLS
         if chunk_call:
             assert "EXCERPT" in excerpt and "Sealed bids" in excerpt  # stage 1 reads the document in chunks
-            assert "EVALUATION FACTORS" in system and "EVALUATION RUBRIC" in system
+            assert "EVALUATION FACTORS" in system
         else:
             assert "PROCUREMENT DOCUMENT" in system and "Sealed bids" in system
         if "Show Stoppers" in names:
@@ -557,38 +557,6 @@ def test_stage3_context_goes_in_the_system_message_so_the_cache_covers_it():
     assert users[0] != users[1] and not any("R-001" in u for u in users)
 
 
-def test_evaluation_rubric_shows_the_pages_the_factors_cite():
-    _, shred = rule_shred()
-    result = _pdf_like(["Cover page", "Technical approach 60 points. Price 40 points.", "Terms", "Scoring steps"])
-    shred.tabs["Evaluation Summary"] = [
-        {"criterion_factor": "Technical approach", "source_location": "p. 2, table"},
-        {"criterion_factor": "Price", "source_location": "p. 4, Evaluation"},
-    ]
-    rubric = shred_ai._evaluation_rubric(shred, result)
-    assert "=== Page 2 ===\nTechnical approach 60 points" in rubric and "=== Page 4 ===" in rubric
-    assert "Cover page" not in rubric and "=== Page 3 ===\nTerms" in rubric  # between two cited pages
-    assert shred_ai._evaluation_rubric(shred, result, limit=20).endswith("omitted]")
-    # Pages between cited evaluation pages are filled in when close together (the rubric sits between them).
-    pages = _pdf_like([f"page {i}" for i in range(1, 21)])
-    shred.tabs["Evaluation Summary"] = [{"source_location": f"p. {p}"} for p in (3, 6, 15)]
-    assert [p for p in range(1, 21) if f"=== Page {p} ===" in shred_ai._evaluation_rubric(shred, pages)] == [
-        3,
-        4,
-        5,
-        6,
-        15,
-    ]
-    shred.tabs["Evaluation Summary"] = []
-    assert shred_ai._evaluation_rubric(shred, result) == "(not found)"
-
-
-def test_evaluation_rubric_without_pages_uses_the_cited_sections():
-    _, shred = rule_shred()
-    result = _docx_like([(1, "4. EVALUATION", ["Technical 60 points"]), (1, "5. TERMS", ["Net 30"])])
-    shred.tabs["Evaluation Summary"] = [{"criterion_factor": "Technical", "source_location": "4. EVALUATION"}]
-    assert shred_ai._evaluation_rubric(shred, result) == "4. EVALUATION\nTechnical 60 points"
-
-
 def test_second_look_places_rows_or_leaves_them_unverified():
     from doc_to_excel.chunking import UNVERIFIED
 
@@ -667,3 +635,34 @@ def test_force_check_notes_disagreements_without_changing_the_label():
     assert rows[2]["notes"] == 'x; Force check: the wording ("must") reads as Mandatory, not Advisory.'
     assert "reads as Conditional" in rows[3]["notes"]
     assert [r["requirement_force"] for r in rows][:4] == ["Mandatory", "Mandatory", "Advisory", "Mandatory"]
+
+
+def test_evaluate_scores_grounding_and_recall_against_a_reference(tmp_path):
+    from evaluate import score
+
+    result = _pdf_like(["Cover page", "The vendor shall submit three signed copies by mail", "Bids due Jan 5, 2026"])
+
+    def workbook(name, requirements, dates):
+        _, shred = rule_shred()
+        shred.tabs["Compliance Matrix"] = [
+            {"id": f"R-00{i}", "requirement_text": text, "source_location": loc, "evaluation_link": link}
+            for i, (text, loc, link) in enumerate(requirements, start=1)
+        ]
+        shred.tabs["Key Dates"] = [{"id": f"KD-00{i}", "date": d} for i, d in enumerate(dates, start=1)]
+        path = tmp_path / name
+        path.write_bytes(build_shred_workbook(shred))
+        return path
+
+    reference = workbook(
+        "reference.xlsx",
+        [("The vendor shall submit three signed copies", "p. 2", ""), ("Provide a performance bond", "p. 3", "")],
+        ["Jan 5, 2026", "Dec 3, 2025"],
+    )
+    candidate = workbook(
+        "candidate.xlsx",
+        [("The vendor shall submit three signed copies by mail", "p. 2", "Price (40)"), ("Made-up rule", "p. 1", "")],
+        ["Jan 5, 2026"],
+    )
+    s = score(result, reference, candidate)
+    assert (s["requirements"], s["ungrounded"], s["grounded"]) == (2, 1, 0.5)
+    assert s["requirement_recall"] == 0.5 and s["date_recall"] == 0.5 and s["evaluation_link"] == 0.5

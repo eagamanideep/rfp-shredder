@@ -8,7 +8,7 @@ A. Stages 1 and 2 run together.
       the page text (see chunking.py), and a screening tab no chunk found anything for keeps its rule-based Not Found
       row. A requirement the text check cannot place gets a second look from a small model, which may place it on
       a nearby page; a requirement whose Requirement Force disagrees with its wording gets a note. Every chunk
-      sees the document outline, the evaluation factors and the pages they come from, so it can fill Evaluation Link.
+      sees the document outline and the evaluation factors, so it can fill Evaluation Link.
    2. The topical tabs, one call per tab, over the whole document. They leave their requirement-ID columns empty,
       since the requirements do not exist yet.
 B. Stage 3 and the ID links run together.
@@ -50,7 +50,6 @@ from .chunking import (
     add_note,
     check_citations,
     cite_page,
-    cited_pages,
     merge_chunk_rows,
     page_texts_with_tables,
     plan_chunks,
@@ -240,8 +239,7 @@ You are given ONE EXCERPT of the document (the pages named in the task), plus th
 - Text marked CONTEXT ONLY belongs to the next excerpt: read it to complete a row, never return rows that begin there.
 - Leave Related IDs empty; they are linked later.
 - Evaluation Link: when a row clearly supports one of the EVALUATION FACTORS below, name that factor and its weight;
-  otherwise leave it empty. The EVALUATION RUBRIC (the pages the factors come from) says what each factor scores;
-  it is reference only, so never return rows from it unless those pages are also in your excerpt.
+  otherwise leave it empty.
 - Screening tabs (Accessibility 508 ADA, Contract Vehicle Eligibility, Supplier Diversity Set-Aside): return rows only
   for matching content in the excerpt, and an empty array when there is none. Never return Not Found rows for them;
   absence across the whole document is recorded later.
@@ -268,11 +266,6 @@ STAGE2_RULE = (
     "The Compliance Matrix is built in parallel with this call: leave Requirement IDs / Related Requirement IDs "
     "empty; they are linked afterwards."
 )
-# Characters of the evaluation pages shown to every chunk call (in the system message, so it is cached). Pages
-# between two cited evaluation pages up to RUBRIC_GAP_PAGES apart are included: the rule-based shred finds the factor
-# table and the scoring steps, and the rubric often sits between them.
-EVALUATION_RUBRIC_CHARS = 15_000
-RUBRIC_GAP_PAGES = 5
 # Requirements the text check could not place get a second look from this model, whichever model runs the shred.
 RECHECK_MODEL = "gpt-5-nano"
 RECHECK_PROMPT = """You check where a requirement extracted from a procurement document appears in that document.
@@ -395,8 +388,7 @@ def build_ai_shred(
     chunk_system = (
         f"{SYSTEM_PROMPT}{CHUNK_RULES}\nSource file name: {base.source_file}\n\n"
         f"===== DOCUMENT OUTLINE =====\n{_outline(result)}\n\n"
-        f"===== EVALUATION FACTORS =====\n{_evaluation_factors(base)}\n\n"
-        f"===== EVALUATION RUBRIC =====\n{_evaluation_rubric(base, result)}"
+        f"===== EVALUATION FACTORS =====\n{_evaluation_factors(base)}"
     )
 
     def run_chunk(names: tuple[str, ...], i: int) -> dict:
@@ -627,31 +619,6 @@ def _evaluation_factors(shred: Shred) -> str:
         if r.get("criterion_factor")
     ]
     return "\n".join(lines) or "(none detected; leave Evaluation Link empty unless the excerpt names a factor)"
-
-
-def _evaluation_rubric(shred: Shred, result: ExtractionResult, limit: int = EVALUATION_RUBRIC_CHARS) -> str:
-    """The text the rule-based evaluation factors were found in (their pages, or sections without pages), capped."""
-    locations = [str(r.get("source_location", "")) for r in shred.tabs.get("Evaluation Summary", [])]
-    if result.file_type == "pdf":
-        texts = page_texts_with_tables(result)
-        cited = sorted({p for loc in locations for p in cited_pages(loc, len(texts))})
-        pages = [
-            p
-            for a, b in zip(cited, cited[1:] + cited[-1:])
-            for p in (range(a, b) if b - a <= RUBRIC_GAP_PAGES else [a])
-        ]
-        pages = sorted(set(pages + cited[-1:]))
-        parts = [f"=== Page {p} ===\n{texts[p - 1]}" for p in pages]
-    else:
-        parts = [
-            f"{s.heading}\n{s.content}"
-            for s in result.sections
-            if s.heading and any(s.heading[:67] in loc for loc in locations)
-        ]
-    text = "\n\n".join(parts)
-    if not text:
-        return "(not found)"
-    return text if len(text) <= limit else text[:limit] + "\n[…rest of the evaluation pages omitted]"
 
 
 def _apply_opportunity(shred: Shred, opp: dict) -> None:

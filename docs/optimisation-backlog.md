@@ -6,8 +6,8 @@ code, and how to check it. The numbers come from benchmarks on that one RFP (Oct
 estimates as starting points.
 
 **Status (Oct 23, 2026):** items 1, 3 and 11 are done; see [Done](#done) for what was measured. Item 1 turned out
-not to pay, but measuring it found a larger cache fix in stage 3. Items 7, 8 and 9 are built and measured in one live run;
-see [Quality checks](#quality-checks-7-8-9). Item 7 is not yet shown to help.
+not to pay, but measuring it found a larger cache fix in stage 3. Items 8 and 9 are done, and item 7 was tried and
+removed; see [Quality checks](#quality-checks-7-8-9). The evaluation script is in the repo as `evaluate.py`.
 
 ## Where the time and money go now
 
@@ -27,8 +27,8 @@ already cached.
 ## Recommended order
 
 1. ~~**No risk to quality:** cache warm-up (1), straggler resend (3), chunking for Word documents (11).~~ Done.
-2. ~~**Quality:** scoring rubric in chunk calls (7), second look at Unverified rows (8).~~ Built, with the Force
-   check (9); 7 needs more runs to tell whether it helps.
+2. ~~**Quality:** scoring rubric in chunk calls (7), second look at Unverified rows (8).~~ 8 and the Force check (9)
+   done; 7 removed, since it lowered grounding.
 3. **Needs careful measuring:** shorter cells (2).
 4. **Needs a person:** the hand-checked answer key (10).
 
@@ -104,11 +104,12 @@ note to Notes where they disagree. Do not overwrite the model's label: wording a
 Department may reject...".
 
 **10. Answer key and evaluation in the repo.** Grounding and recall are measured against a `gpt-5.6-sol` workbook,
-which is model output, by an evaluation script that lives outside the repo. To fix both:
+which is model output, by [evaluate.py](../evaluate.py) (moved into the repo on Oct 23). To fix the rest:
 - Have a proposal reviewer hand-check about 30 Compliance Matrix requirements from `rfp-1.pdf` (correct text and
   page, plus any the shred missed).
 - Store that answer key as a fixture in the repo.
-- Move the evaluation script into the repo (`evaluate.py`), with a documented pass threshold.
+- ~~Move the evaluation script into the repo (`evaluate.py`)~~ done; add a documented pass threshold once the
+  answer key exists.
 - Add more RFPs to `rfp_docs/`; every number above comes from one document.
 
 ## Gaps
@@ -162,34 +163,34 @@ than half the time and found 70% more requirements, at the same recall.
 
 ## Quality checks (7, 8, 9)
 
-One `gpt-6-luna` run on `rfp-1.pdf` (Oct 23), against the last run before the change (step 5d). One run of each, so
-small differences are run-to-run variance.
+`gpt-6-luna` on `rfp-1.pdf`, Oct 23, scored by `evaluate.py` against the Oct 21 `gpt-5.6-sol` workbook. One run each,
+so a few points either way is run-to-run variance (the three runs before the change span 74–78% recall).
 
-| Run | Time | Cost | Requirements | Unverified after checks | Evaluation Link pp. 1–18 / 19–24 / 25–31 |
-| --- | --- | --- | --- | --- | --- |
-| Before (step 5d) | 114–128 s | $0.093–$0.099 | 384 | 14 | 58% / 41% / 16% |
-| After | 146 s | $0.105 | 447 | 2 | 61% / 63% / 17% |
+| Run | Time | Cost | Requirements | Grounded | Requirement recall | Evaluation Link |
+| --- | --- | --- | --- | --- | --- | --- |
+| Before (step 5d; two Oct 23 runs) | 114–128 s | $0.093–$0.099 | 384–408 | 95–96% | 74–78% | 41–45% |
+| With 7, 8 and 9 | 146 s | $0.105 | 447 | 92% | 73% | 46% |
+| With 8 and 9 (7 removed) | 120 s | $0.096 | 374 | 97% | 78% | 36% |
 
-**7. Rubric in chunk calls: inconclusive.** `_evaluation_rubric` adds the pages the rule-based Evaluation Summary
-cites to the chunk system prompt, filling gaps of up to 5 pages between them (capped at 15,000 characters). On
-`rfp-1.pdf` the rule-based rows cite pp. 19 and 24, and the gap brings in the rubric on pp. 20–23 (12,924
-characters, ~3K tokens, cached). Evaluation Link rose on the evaluation pages, but barely elsewhere, and that was the
-aim. The chunk that owns pp. 19–22 also wrote a row per rubric bullet: 36 rows on pp. 20–23 against 10 before, most
-of the 63 extra requirements. Those rows are grounded ("Priority 1 scoring considers..."), but whether a proposal
-team wants them in the Compliance Matrix is a judgement call. Next: two or three more runs, plus Evaluation Link
-coverage by the evaluation script, before keeping it.
+**7. Rubric in chunk calls: tried, removed.** The chunk system prompt got the pages the rule-based Evaluation Summary
+cites, with gaps of up to 5 pages filled in (pp. 19–24 on `rfp-1.pdf`, ~3K cached tokens). Evaluation Link rose on
+the evaluation pages (41% to 63%) but barely elsewhere (58% to 61% on pp. 1–18, 16% to 17% on pp. 25–31), and that was
+the aim. The chunk that owns those pages also wrote a reworded row per rubric bullet ("Priority 1 scoring
+considers..."): 36 rows on pp. 20–23 against 10 before. Ungrounded rows elsewhere held at 8–9, but on pp. 20–23 they
+went from 6–12 to 26, so grounding fell to 92%. Evaluation Link swings between 36% and 46% from run to run anyway, so
+a fix for it needs several runs per variant to measure.
 
 **8. Second look at Unverified rows: done, without drops.** `_second_look` sends each Unverified requirement to
 `gpt-5-nano` (low effort), whatever model runs the shred. It sees the cited pages, their neighbours, and the page
-sharing the most words with the row; a page it names among those replaces the citation, and Notes say so. It placed
-34 of 36. 31 of those are on the page with the most word overlap; the other 3 are plausible table rows. It also
-said two rows were on no page, but both were in the rubric table on p. 22, which it had been shown. So rows are
-never dropped: anything not placed stays Unverified. Cost under $0.01; 17 s at the end of stage 1, which made stage 1
-(98 s) the critical path of phase A.
+sharing the most words with the row; a page it names among those replaces the citation, and Notes say so. In the
+first run it placed 34 of 36: 31 on the page with the most word overlap, the other 3 plausible table rows. It said
+two rows were on no page, but both were in the rubric table on p. 22, which it had been shown, so rows are never
+dropped: anything not placed stays Unverified. In the second run it placed all 12. Cost under $0.01; in the first run
+it took 17 s at the end of stage 1. `evaluate.py` still counts a placed row as ungrounded, since its words do not match the page.
 
 **9. Requirement Force check: done.** `_check_force` notes rows whose wording suggests another Force ("shall",
 "must", "required", "may not" = Mandatory; "may", "should" = Advisory; "if", "unless", "in the event" = Conditional,
 when the row also has one of the others). The label is not changed. Only Mandatory and Advisory rows are checked:
 the first version also checked Conditional rows, and 30 of its 41 notes were on Conditional rows whose condition is in
-the surrounding text. With that change it flags 11 of 447 rows on this run. A "may" in a subordinate clause
-("barriers that may affect") or before a date is not counted.
+the surrounding text. Now it flags 11–14 rows a run (3–4%). A "may" in a subordinate clause ("barriers that may
+affect") or before a date is not counted.

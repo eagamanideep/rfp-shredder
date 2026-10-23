@@ -32,9 +32,8 @@ Two analysis modes:
   structured-output calls. Stages 1 and 2 run at the same time, then stage 3 and the ID links:
   1. **Compliance Matrix, Key Dates and the screening tabs** (Accessibility, Contract Vehicle, Supplier
      Diversity), extracted from section-aligned page chunks (a Word or text document, which has no pages, is cut
-     into runs of sections instead, and its tables form a chunk of their own). Every chunk sees the document outline, the
-     evaluation factors and the pages they come from (the scoring rubric), so requirements carry their Evaluation
-     Link. The rows are merged in page order without repeats, each requirement's text is checked against the page it
+     into runs of sections instead, and its tables form a chunk of their own). Every chunk sees the document outline and the
+     evaluation factors, so requirements carry their Evaluation Link. The rows are merged in page order without repeats, each requirement's text is checked against the page it
      cites (the page is corrected, or the row is marked *Unverified* in Notes), and dates are normalised. Each
      Unverified requirement gets a second look from `gpt-5-nano`, which places it on one of the nearby pages (the
      citation is corrected) or leaves it marked Unverified. A requirement whose wording suggests a different
@@ -143,6 +142,16 @@ python benchmark.py "RFP.pdf" --models gpt-6-luna gpt-5-nano
 Models run one after another so their timings don't compete; each workbook is saved to `runs/`, and the tokens,
 cost and citation rate are printed per model. `--effort` and `--chunk-chars` override the model's recommended
 settings (`--chunk-chars 0` reads the document whole). Use `rule` as a model name to time the rule-based pipeline.
+
+To score workbooks (no model calls) against the source PDF and a reference workbook:
+
+```bash
+python evaluate.py "RFP.pdf" "runs/RFP - gpt-5.6-sol.xlsx" "runs/RFP - gpt-6-luna.xlsx"
+```
+
+It prints, per workbook, the Compliance Matrix's grounding (rows whose text is on the cited page, by the same test as
+the citation check), recall of the reference's requirements and key dates, and Evaluation Link / Related IDs
+coverage. The reference is itself model output, so recall measures agreement with it.
 
 Further speed, cost and quality work is listed in [docs/optimisation-backlog.md](docs/optimisation-backlog.md).
 
