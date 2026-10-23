@@ -1,4 +1,4 @@
-# SSO integration
+# RFP Shredder
 
 ## RFP Shred — document to Excel
 
