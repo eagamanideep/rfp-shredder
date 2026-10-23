@@ -5,6 +5,9 @@ to 117–128 s on `rfp-1.pdf` (31 pages). Each item lists its expected effect, i
 code, and how to check it. The numbers come from benchmarks on that one RFP (Oct 21–22, 2026), so treat the
 estimates as starting points.
 
+**Status (Oct 23, 2026):** items 1, 3 and 11 are done; see [Done](#done) for what was measured. Item 1 turned out
+not to pay, but measuring it found a larger cache fix in stage 3.
+
 ## Where the time and money go now
 
 A run lasts as long as its slowest call in each of two phases (see the module docstring in
@@ -22,7 +25,7 @@ already cached.
 
 ## Recommended order
 
-1. **No risk to quality:** cache warm-up (1), straggler resend (3), chunking for Word documents (11).
+1. ~~**No risk to quality:** cache warm-up (1), straggler resend (3), chunking for Word documents (11).~~ Done.
 2. **Quality:** scoring rubric in chunk calls (7), second look at Unverified rows (8).
 3. **Needs careful measuring:** shorter cells (2).
 4. **Needs a person:** the hand-checked answer key (10).
@@ -117,3 +120,40 @@ them.
 
 **12. Scanned PDFs.** There is no OCR, so a scanned RFP yields no text (see the README's Limitations). This is out of
 scope for performance work, but worth tracking.
+
+## Done
+
+Measured on `rfp-1.pdf` with `gpt-6-luna`, each run on a fresh cache prefix (a run started minutes after another
+reads that run's cache and looks better than it is).
+
+| Run | Time | Cost | Cached input | Grounding | Recall | Requirements |
+| --- | --- | --- | --- | --- | --- | --- |
+| Before (two runs, Oct 22) | 117–128 s | $0.094–$0.103 | 73–81% | 95–96% | 78–79% | — |
+| After (two runs) | 114 s, 128 s | $0.099, $0.093 | 78%, 82% | 95%, 95% | 74%, 77% | 392, 408 |
+| Word copy of the RFP, chunked by section | 126 s | $0.095 | 82% | n/a (no pages) | 79% | 382 |
+| Word copy of the RFP, read whole (before) | 270 s | $0.065 | 80% | n/a (no pages) | 79% | 224 |
+
+The page chunks and chunk prompts are byte-for-byte the same as before, so the PDF recall difference is
+run-to-run variance in the model, not the change. Stage 3 output (26 Show Stoppers rows, readiness, issue log) was
+complete in every run.
+
+**1. Cache warm-up: measured, not adopted.** Without it, the 12 stage-2 calls already read 91% of their input from
+the cache (they reach the server a moment apart); with it, 99%. That is ~19K tokens, $0.002 a `gpt-6-luna` run,
+for 2.5 s more on the critical path. Measuring it showed why stage 3 cached poorly: **OpenAI's prompt cache reuses
+only the system message**, not the start of the user message (a probe with the same 10K-token text: 2.4K tokens
+cached at the start of the user message, all 10K in the system message). Stage 3's summary of the finished tabs
+was in the user message, so each of its six calls paid for ~21K uncached tokens. It is now in the system message:
+the issue-log and readiness calls read 100% from the cache, and stage 3 went from ~49 s to 32–36 s.
+
+**3. Straggler resend: done.** `_run_parallel` in `shred_ai.py` runs every phase. A call still running after 2× the
+median time of its finished peers of the same kind (and at least 30 s, with at least half of them finished) is
+sent again, and the first copy to answer is used. Link calls now return their links instead of writing the rows,
+so a losing copy cannot change the shred; its tokens are still billed and recorded if it finishes before the run
+is logged. One call was resent in each verification run (a stage-2 tab twice, a Compliance Matrix chunk once).
+
+**11. Word documents: done.** `plan_chunks` cuts a document without pages into runs of whole sections of about the
+chunk size, before a top-level heading when possible; a section longer than a chunk is split at paragraphs. The
+tables (which have no position in a Word document's text) form a last chunk, and before this change they were
+missing from the Compliance Matrix call altogether. Rows cite section headings; a failed chunk falls back to the
+rule-based rows that cite its headings; the page check is skipped. On a Word copy of `rfp-1.pdf` the run took less
+than half the time and found 70% more requirements, at the same recall.
