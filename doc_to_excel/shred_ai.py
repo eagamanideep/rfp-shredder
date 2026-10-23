@@ -22,6 +22,13 @@ Every call uses the same response schema (all tabs; a call fills only its own an
 prompt cache covers the schema too, so a schema per call would stop the cache from serving the document.
 
 Any group that fails keeps its rule-based rows and adds a warning, so a run always produces a full workbook.
+
+OpenAI's prompt cache reuses only the system message (and the schema), not the start of a user message, so
+anything several calls share goes in the system message: the document, the chunk outline, and stage 3's summary of
+the finished tabs. Each call's own task and excerpt go in the user message.
+
+A call that runs far longer than the finished calls of its kind is sent again, and whichever copy finishes first is
+used (_run_parallel), so a phase does not wait on one stalled request.
 """
 
 from __future__ import annotations
@@ -30,11 +37,12 @@ import json
 import re
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime
+from statistics import median
 
-from .chunking import Chunk, check_citations, cited_pages, merge_chunk_rows, plan_chunks
+from .chunking import Chunk, check_citations, merge_chunk_rows, plan_chunks
 from .extract import ExtractionResult
 from .shred import Shred, assign_ids
 from .shred_schema import SHOW_STOPPER_AREAS, TAB_BY_NAME, column_key
@@ -247,6 +255,10 @@ STAGE2_RULE = (
     "empty; they are linked afterwards."
 )
 SHOW_STOPPER_PARTS = 3
+# A call still running after STRAGGLER_FACTOR x the median time of its finished peers (and at least
+# STRAGGLER_MIN_SECONDS) is sent again. Peers must be at least half of their kind, and two or more.
+STRAGGLER_FACTOR = 2.0
+STRAGGLER_MIN_SECONDS = 30.0
 ISSUE_LOG_PARTS = (
     "Cover ONLY contradictions (between pages, sections or tabs) and missing or referenced-but-unsupplied sources.",
     "Cover ONLY ambiguities and open questions that need a clarification; contradictions and missing sources are "
@@ -354,7 +366,7 @@ def build_ai_shred(
         return _call(client, config, chunk_system, names, "", date, opportunity, usage=shred.usage, excerpt=excerpt)
 
     rule_show_stoppers = list(shred.tabs.get("Show Stoppers", []))
-    report(0.05, f"Stages 1-2: requirements from {len(chunks)} page chunks, and the topical tabs…")
+    report(0.05, f"Stages 1-2: requirements from {len(chunks)} chunks, and the topical tabs…")
     start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=2) as pool:
         stage1 = pool.submit(_run_stage1, shred, result, chunks, run_chunk, config.max_parallel)
@@ -390,26 +402,18 @@ def _run_stage1(shred: Shred, result: ExtractionResult, chunks: list[Chunk], run
     A failed chunk keeps the rule-based rows that cite its pages, so the tab still covers the whole document.
     """
     rule_rows = {name: list(shred.tabs.get(name, [])) for name in STAGE1_TABS}
-    jobs = [(names, i) for i in range(len(chunks)) for names in CHUNK_CALLS]
-
-    def timed_call(job):
-        start = time.perf_counter()
-        try:
-            return run_chunk(*job), None, time.perf_counter() - start
-        except Exception as exc:  # noqa: BLE001 - keep the rule-based rows and report the failure
-            return None, exc, time.perf_counter() - start
+    jobs = {(names, i): lambda j=(names, i): run_chunk(*j) for i in range(len(chunks)) for names in CHUNK_CALLS}
 
     start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=max(1, min(max_parallel, len(jobs)))) as pool:
-        futures = {job: pool.submit(timed_call, job) for job in jobs}
+    # Peers are the calls for the same tabs; a table-only chunk is shorter than the others, which is harmless.
+    results = _run_parallel(jobs, lambda job: job[0], max_parallel)
     elapsed = time.perf_counter() - start
 
     rows = {name: [[] for _ in chunks] for name in STAGE1_TABS}
-    for (names, i), future in futures.items():
-        data, exc, seconds = future.result()
+    for (names, i), (data, exc, seconds, resent) in results.items():
         chunk = chunks[i]
         label = "Screening" if names == SCREENING_TABS else names[0]
-        shred.timings.append((f"AI stage 1 · {label} · {chunk.label}", seconds))
+        shred.timings.append((f"AI stage 1 · {label} · {chunk.label}{' (resent)' if resent else ''}", seconds))
         if exc is None:
             for name in names:
                 rows[name][i] = data[column_key(name)]
@@ -419,11 +423,9 @@ def _run_stage1(shred: Shred, result: ExtractionResult, chunks: list[Chunk], run
             continue
         for name in names:
             rows[name][i] = [
-                r
-                for r in rule_rows[name][1 if name == "Key Dates" else 0 :]
-                if any(chunk.first_page <= p <= chunk.last_page for p in cited_pages(r.get("source_location"), 10**6))
+                r for r in rule_rows[name][1 if name == "Key Dates" else 0 :] if chunk.owns(r.get("source_location"))
             ]
-        shred.warnings.append(f"AI failed for {label}, {chunk.label} ({exc}); those pages use rule-based rows.")
+        shred.warnings.append(f"AI failed for {label}, {chunk.label} ({exc}); that part uses rule-based rows.")
     shred.timings.append(("AI stage 1 total (chunks run in parallel)", elapsed))
 
     for name in SCREENING_TABS:
@@ -534,20 +536,12 @@ def _outline(result: ExtractionResult) -> str:
 def _run_groups(shred: Shred, stage: str, groups, call) -> None:
     """Run each group's call in parallel and store one list of rows per tab."""
 
-    def timed_call(names):
-        start = time.perf_counter()
-        try:
-            return call(names), None, time.perf_counter() - start
-        except Exception as exc:  # noqa: BLE001 - keep the rule-based rows and report the failure
-            return None, exc, time.perf_counter() - start
-
     start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=len(groups)) as pool:
-        futures = {names: pool.submit(timed_call, names) for names in groups}
+    # Every group reads the whole document, so they are all peers.
+    results = _run_parallel({names: lambda n=names: call(n) for names in groups}, lambda _names: stage)
     elapsed = time.perf_counter() - start
-    for names, future in futures.items():
-        data, exc, seconds = future.result()
-        shred.timings.append((f"{stage} · {', '.join(names)}", seconds))
+    for names, (data, exc, seconds, resent) in results.items():
+        shred.timings.append((f"{stage} · {', '.join(names)}{' (resent)' if resent else ''}", seconds))
         if exc is not None:
             shred.warnings.append(f"AI failed for {', '.join(names)} ({exc}); those tabs are rule-based.")
             continue
@@ -588,27 +582,23 @@ def _run_stage3(shred: Shred, run, context: str, link) -> None:
         if shred.tabs.get(tab):
             jobs[f"Links · {tab}"] = (None, lambda t=tab: link(t))
 
-    def timed_call(fn):
-        start = time.perf_counter()
-        try:
-            return fn(), None, time.perf_counter() - start
-        except Exception as exc:  # noqa: BLE001 - keep the rule-based rows and report the failure
-            return None, exc, time.perf_counter() - start
-
     start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-        futures = {label: pool.submit(timed_call, fn) for label, (_, fn) in jobs.items()}
+    # Peers are calls of the same kind (Show Stoppers parts, issue-log parts, link calls).
+    results = _run_parallel(
+        {label: fn for label, (_, fn) in jobs.items()}, lambda label: jobs[label][0] or "Links", len(jobs)
+    )
     elapsed = time.perf_counter() - start
 
     parts: dict[str, list[list[dict]]] = {name: [] for name in STAGE3_GROUP}
-    for label, future in futures.items():
-        data, exc, seconds = future.result()
+    for label, (data, exc, seconds, resent) in results.items():
         tab = jobs[label][0]
-        shred.timings.append((f"AI stage 3 · {label}", seconds))
+        shred.timings.append((f"AI stage 3 · {label}{' (resent)' if resent else ''}", seconds))
         if exc is not None:
             shred.warnings.append(
                 f"AI failed for {label} ({exc}); " + ("rule-based rows fill in." if tab else "links left empty.")
             )
+        elif tab is None:
+            _apply_links(shred, label.removeprefix("Links · "), data)
         elif tab:
             parts[tab].append(data[column_key(tab)])
             if not data[column_key(tab)]:
@@ -628,8 +618,11 @@ def _run_stage3(shred: Shred, run, context: str, link) -> None:
         assign_ids(shred.tabs, [tab])
 
 
-def _link_call(client, config: AIConfig, shred: Shred, tab: str) -> None:
-    """Fill one tab's requirement-ID column from the Compliance Matrix (only IDs that exist are kept)."""
+def _link_call(client, config: AIConfig, shred: Shred, tab: str) -> dict[str, str]:
+    """One tab's requirement IDs per row ID, from the Compliance Matrix (only IDs that exist are kept).
+
+    Returned rather than written to the rows, because a resent copy of the call may still be running.
+    """
     column = LINKED_COLUMNS[tab]
     requirements = shred.tabs.get("Compliance Matrix", [])
     known = {r["id"] for r in requirements}
@@ -658,8 +651,67 @@ def _link_call(client, config: AIConfig, shred: Shred, tab: str) -> None:
             break
     else:
         raise ShredAIError("the link call returned no requirement IDs for any row")
-    for row in shred.tabs[tab]:
-        row[column] = ", ".join(dict.fromkeys(links[row["id"]][:6]))
+    return {row_id: ", ".join(dict.fromkeys(ids[:6])) for row_id, ids in links.items()}
+
+
+def _apply_links(shred: Shred, tab: str, links: dict[str, str]) -> None:
+    column = LINKED_COLUMNS[tab]
+    for row in shred.tabs.get(tab, []):
+        row[column] = links.get(row["id"], "")
+
+
+def _run_parallel(jobs: dict, peer_group: Callable, max_parallel: int | None = None) -> dict:
+    """Run every job at once; resend a straggler and keep whichever copy finishes first.
+
+    Returns {key: (result, exception, seconds, resent)} in the order of `jobs`; seconds run from the first send.
+    A copy that loses the race is left to finish in the background (its tokens are still billed and recorded).
+    """
+    results: dict = {}
+    if not jobs:
+        return results
+    started: dict = {}
+    pending: dict = {}  # future -> key
+    resent: set = set()
+    finished: dict[str, list[float]] = {}
+    groups = {key: peer_group(key) for key in jobs}
+    group_size = {g: list(groups.values()).count(g) for g in set(groups.values())}
+
+    def attempt(key):
+        started.setdefault(key, time.perf_counter())
+        try:
+            return jobs[key](), None
+        except Exception as exc:  # noqa: BLE001 - the caller keeps the rule-based rows and reports the failure
+            return None, exc
+
+    # A resent copy waits for a free worker; workers free up as the peers it is measured against finish.
+    pool = ThreadPoolExecutor(max_workers=max(1, min(max_parallel or len(jobs), len(jobs))))
+    try:
+        for key in jobs:
+            pending[pool.submit(attempt, key)] = key
+        while len(results) < len(jobs):
+            done, _ = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+            now = time.perf_counter()
+            for future in done:
+                key = pending.pop(future)
+                if key in results:
+                    continue  # the other copy already won
+                data, exc = future.result()
+                if exc is not None and key in pending.values():
+                    continue  # this copy failed; wait for the other one
+                results[key] = (data, exc, now - started[key], key in resent)
+                if exc is None:
+                    finished.setdefault(groups[key], []).append(now - started[key])
+            for key in jobs:
+                peers = finished.get(groups[key], [])
+                waiting = key in results or key in resent or key not in started
+                if waiting or len(peers) < max(2, group_size[groups[key]] / 2):
+                    continue
+                if now - started[key] > max(STRAGGLER_MIN_SECONDS, STRAGGLER_FACTOR * median(peers)):
+                    resent.add(key)
+                    pending[pool.submit(attempt, key)] = key
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return {key: results[key] for key in jobs}
 
 
 def _fill_code_columns(shred: Shred) -> None:
@@ -772,6 +824,9 @@ def _call(
     note: str = "",
     areas: range | None = None,
 ) -> dict:
+    if context:
+        # In the system message, so the prompt cache serves it to every stage-3 call after the first.
+        system = f"{system}\n\n===== TABS ALREADY BUILT (cite these IDs) =====\n{context}"
     task = [
         f"Shred run date: {run_date}.",
         "Produce ONLY these tabs; return an empty array for every other tab in the schema:",
@@ -799,8 +854,6 @@ def _call(
         task.append("\nAlso return `opportunity`: issuing organisation (client), solicitation number, and title.")
     else:
         task.append("\nReturn empty strings in `opportunity`.")
-    if context:
-        task.append(f"\n===== TABS ALREADY BUILT (cite these IDs) =====\n{context}")
     if excerpt:
         task.append(excerpt)
 
@@ -808,7 +861,14 @@ def _call(
 
 
 def _request(
-    client, config: AIConfig, system: str, user: str, schema_name: str, schema: dict, step: str, usage
+    client,
+    config: AIConfig,
+    system: str,
+    user: str,
+    schema_name: str,
+    schema: dict,
+    step: str,
+    usage,
 ) -> dict:
     kwargs = {
         "model": config.model,

@@ -31,7 +31,8 @@ Two analysis modes:
   (default) or another GPT-6 / GPT-5.x model selectable in the sidebar, in two phases of parallel
   structured-output calls. Stages 1 and 2 run at the same time, then stage 3 and the ID links:
   1. **Compliance Matrix, Key Dates and the screening tabs** (Accessibility, Contract Vehicle, Supplier
-     Diversity), extracted from section-aligned page chunks. Every chunk sees the document outline and the
+     Diversity), extracted from section-aligned page chunks (a Word or text document, which has no pages, is cut
+     into runs of sections instead, and its tables form a chunk of their own). Every chunk sees the document outline and the
      evaluation factors, so requirements carry their Evaluation Link. The rows are merged in page order without
      repeats, each requirement's text is checked against the page it cites (the page is corrected, or the row is
      marked *Unverified* in Notes), and dates are normalised. A screening tab with no match in any chunk keeps the
@@ -42,6 +43,9 @@ Two analysis modes:
      everything before them. Alongside them, a short link call per topical tab fills its requirement-ID column
      from the finished Compliance Matrix (only IDs that exist are kept), and requirements are linked in code to
      the key dates they state and the forms they name.
+
+  A call that runs more than twice as long as the finished calls of its kind (and over 30 s) is sent again, and
+  whichever copy answers first is used, so one stalled request does not hold up its phase.
 
   Source File and Amendment / Version are the same on every row, so they are filled in code rather than written
   by the model. Each model has a recommended reasoning effort and chunk size (`MODEL_SETTINGS` in
@@ -77,8 +81,10 @@ use the same prices ([`PRICES` in shred_ai.py](doc_to_excel/shred_ai.py)), so up
 | `gpt-5-nano` | $0.05 | $0.005 | $0.40 | — | 400K | 128K | May 31, 2024 |
 
 Reasoning tokens are billed as output. Every call uses the same response schema and, within a stage, the same
-system prompt, so OpenAI's prompt cache serves the repeated part (a different schema per call would defeat it).
-In benchmarks about half of all input tokens were billed at the cached rate.
+system prompt, so OpenAI's prompt cache serves the repeated part (a different schema per call would defeat it). The
+cache reuses only the system message, not the start of the user message, so text that several calls share (the
+document, stage 3's summary of the finished tabs) goes in the system message. In benchmarks 70–80% of all input
+tokens were billed at the cached rate; most of the rest are the page excerpts, which every chunk call has its own of.
 
 **Contract Objections** are screened only against your internal *Contracts Proposal Objection Matrix* — upload it
 (`.xlsx`) in the sidebar. Without it, the tab says the terms were not screened.

@@ -134,9 +134,7 @@ def test_ai_shred_replaces_tabs_and_falls_back_per_group(monkeypatch):
 
     def fake_link(client, config, shred, tab):
         linked.append(tab)
-        column = shred_ai.LINKED_COLUMNS[tab]
-        for row in shred.tabs[tab]:
-            row[column] = "R-001"
+        return {row["id"]: "R-001" for row in shred.tabs[tab]}
 
     monkeypatch.setattr(shred_ai, "_call", fake_call)
     monkeypatch.setattr(shred_ai, "_link_call", fake_link)
@@ -428,9 +426,11 @@ def test_link_call_keeps_only_requirement_ids_that_exist():
     create = lambda **kwargs: sent.append(kwargs) or response  # noqa: E731
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
 
-    shred_ai._link_call(client, AIConfig("sk-test"), shred, "Submission Mechanics")
-    rows = shred.tabs["Submission Mechanics"]
-    assert [r["related_requirement_ids"] for r in rows] == ["R-001", ""]
+    links = shred_ai._link_call(client, AIConfig("sk-test"), shred, "Submission Mechanics")
+    assert links == {"SM-001": "R-001", "SM-002": ""}
+    assert "related_requirement_ids" not in shred.tabs["Submission Mechanics"][0]  # applied by the caller
+    shred_ai._apply_links(shred, "Submission Mechanics", links)
+    assert [r["related_requirement_ids"] for r in shred.tabs["Submission Mechanics"]] == ["R-001", ""]
     assert "R-001: Sign in blue ink" in sent[0]["messages"][0]["content"]
 
 
@@ -447,6 +447,111 @@ def test_link_call_retries_when_no_row_gets_a_link():
         return SimpleNamespace(usage=None, choices=[SimpleNamespace(finish_reason="stop", message=message)])
 
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    shred_ai._link_call(client, AIConfig("sk-test"), shred, "Forms + Attachments")
-    assert [r["related_requirement_ids"] for r in shred.tabs["Forms + Attachments"]] == ["R-001", "", ""]
+    links = shred_ai._link_call(client, AIConfig("sk-test"), shred, "Forms + Attachments")
+    assert list(links.values()) == ["R-001", "", ""]
     assert replies == []  # the empty first answer was retried
+
+
+def test_run_parallel_resends_a_straggler_and_keeps_the_first_copy(monkeypatch):
+    import threading
+
+    monkeypatch.setattr(shred_ai, "STRAGGLER_MIN_SECONDS", 0.2)
+    calls = {"slow": 0}
+    release = threading.Event()
+
+    def slow():
+        calls["slow"] += 1
+        if calls["slow"] == 1:
+            release.wait(5)  # the first copy stalls
+            return "late"
+        return "resent"
+
+    jobs = {"a": lambda: "a", "b": lambda: "b", "c": lambda: "c", "slow": slow}
+    results = shred_ai._run_parallel(jobs, lambda _key: "same kind")
+    release.set()
+    assert {k: v[0] for k, v in results.items()} == {"a": "a", "b": "b", "c": "c", "slow": "resent"}
+    assert results["slow"][3] and not results["a"][3]  # the resent flag
+    assert calls["slow"] == 2
+
+
+def test_run_parallel_does_not_resend_without_peers_or_after_a_failure(monkeypatch):
+    import time
+
+    monkeypatch.setattr(shred_ai, "STRAGGLER_MIN_SECONDS", 0.1)
+    sent = []
+
+    def lone():
+        sent.append("lone")
+        time.sleep(0.5)
+        return "lone"
+
+    def fails():
+        raise RuntimeError("boom")
+
+    results = shred_ai._run_parallel({"lone": lone, "x": fails}, lambda key: key)  # each in its own kind
+    assert results["lone"][:2] == ("lone", None) and sent == ["lone"]
+    assert isinstance(results["x"][1], RuntimeError)
+
+
+def _docx_like(sections, tables=()):
+    from doc_to_excel.extract import ExtractionResult, Paragraph, Section, Table
+
+    heads = [
+        Section(i, level, heading, heading, None, [Paragraph(text, None) for text in paragraphs])
+        for i, (level, heading, paragraphs) in enumerate(sections, start=1)
+    ]
+    text = "\n".join(f"{h.heading}\n{h.content}" for h in heads)
+    return ExtractionResult("rfp.docx", "docx", [text], heads, [], [Table(None, rows) for rows in tables])
+
+
+def test_word_documents_are_chunked_by_section():
+    from doc_to_excel.chunking import plan_chunks
+
+    body = "The vendor shall comply. " * 80  # ~2,000 characters per paragraph
+    result = _docx_like(
+        [
+            (1, "1. INTRODUCTION", [body]),
+            (2, "1.1 Background", [body]),
+            (1, "2. SCOPE OF WORK", [body, body, body]),  # longer than a chunk: split at paragraphs
+            (1, "3. SUBMISSION", [body]),
+        ],
+        tables=[[["Item", "Qty"], ["Switch", "40"]]],
+    )
+    chunks = plan_chunks(result, 4500)
+    assert all(c.first_page == c.last_page == 0 for c in chunks)
+    assert chunks[0].headings == ("1. INTRODUCTION", "1.1 Background")
+    assert "2. SCOPE OF WORK" in chunks[1].text and "CONTEXT ONLY" in chunks[0].text
+    assert "no page numbers" in chunks[0].text
+    assert sum(c.text.count(body) for c in chunks[:-1]) >= 6  # every paragraph belongs to a chunk
+    assert chunks[-1].headings == ("Tables",) and "Switch | 40" in chunks[-1].text
+    assert chunks[1].label.startswith("§ 2. SCOPE OF WORK")
+    # A chunk owns the rule-based rows that cite its headings (used when its call fails).
+    assert chunks[0].owns("1.1 Background") and not chunks[0].owns("3. SUBMISSION")
+    # A short document, or chunking turned off, stays one chunk.
+    assert len(plan_chunks(_docx_like([(1, "A", ["short"])]), 4500)) == 1
+    assert len(plan_chunks(result, 0)) == 1 and "Switch | 40" in plan_chunks(result, 0)[0].text
+
+
+def test_merge_keeps_section_chunk_rows_that_cite_pages():
+    from doc_to_excel.chunking import Chunk, merge_chunk_rows
+
+    rows = [[{"requirement_text": "Submit two copies", "source_location": "p. 4, 3. SUBMISSION"}]]
+    merged = merge_chunk_rows(rows, lambda r: r["requirement_text"], [Chunk(0, 0, "", ("3. SUBMISSION",))])
+    assert len(merged) == 1  # no pages to compare against, so the row is kept
+
+
+def test_stage3_context_goes_in_the_system_message_so_the_cache_covers_it():
+    sent = []
+
+    def create(**kwargs):
+        sent.append(kwargs)
+        message = SimpleNamespace(content="{}", refusal=None)
+        return SimpleNamespace(usage=None, choices=[SimpleNamespace(finish_reason="stop", message=message)])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    for names in (("Shred Readiness",), ("Q&A + Issue Log",)):
+        shred_ai._call(client, AIConfig("sk-test"), "sys", names, "R-001: Sign", "2026-09-20")
+    systems = [kwargs["messages"][0]["content"] for kwargs in sent]
+    users = [kwargs["messages"][1]["content"] for kwargs in sent]
+    assert systems[0] == systems[1] and systems[0].startswith("sys") and "R-001: Sign" in systems[0]
+    assert users[0] != users[1] and not any("R-001" in u for u in users)
