@@ -6,8 +6,8 @@ A. Stages 1 and 2 run together.
    1. Compliance Matrix, Key Dates and the screening tabs (Accessibility, Contract Vehicle, Supplier Diversity),
       extracted from page chunks. The rows are merged in page order, each requirement's citation is checked against
       the page text (see chunking.py), and a screening tab no chunk found anything for keeps its rule-based Not Found
-      row. A requirement the text check cannot place gets a second look from a small model, which places it on a
-      page or drops it; a requirement whose Requirement Force disagrees with its wording gets a note. Every chunk
+      row. A requirement the text check cannot place gets a second look from a small model, which may place it on
+      a nearby page; a requirement whose Requirement Force disagrees with its wording gets a note. Every chunk
       sees the document outline, the evaluation factors and the pages they come from, so it can fill Evaluation Link.
    2. The topical tabs, one call per tab, over the whole document. They leave their requirement-ID columns empty,
       since the requirements do not exist yet.
@@ -487,15 +487,13 @@ def _run_stage1(
     checks = check_citations(requirements, result, "requirement_text")
     if checks["unverified"]:
         recheck_start = time.perf_counter()
-        requirements, placed, dropped = _second_look(requirements, result, recheck, max_parallel)
+        placed = _second_look(requirements, result, recheck, max_parallel)
         shred.timings.append(("AI stage 1 · Citation second look", time.perf_counter() - recheck_start))
-        left = checks["unverified"] - placed - len(dropped)
+        left = checks["unverified"] - placed
         shred.warnings.append(
             f"{checks['unverified']} of {checks['checked']} requirements could not be found on their cited page by "
-            f"the text check. A second check ({RECHECK_MODEL}) placed {placed} on a page and dropped {len(dropped)} "
-            "that none of the nearby pages states"
-            + "".join(f'; "{str(r.get("requirement_text", ""))[:80]}"' for r in dropped)
-            + (f". {left} stay marked Unverified in Notes." if left else ".")
+            f"the text check; a second check ({RECHECK_MODEL}) placed {placed} on a page."
+            + (f" {left} stay marked Unverified in Notes." if left else "")
         )
     flagged = _check_force(requirements)
     if flagged:
@@ -520,13 +518,13 @@ def _is_finding(row: dict, keys: tuple[str, ...]) -> bool:
     return bool(lead) and "not found" not in f"{lead} {row.get('notes') or ''}".lower()
 
 
-def _second_look(
-    rows: list[dict], result: ExtractionResult, recheck, max_parallel: int
-) -> tuple[list[dict], int, list[dict]]:
-    """Ask a small model where each Unverified requirement is, among its cited and nearby pages.
+def _second_look(rows: list[dict], result: ExtractionResult, recheck, max_parallel: int) -> int:
+    """Ask a small model where each Unverified requirement is, among its cited and nearby pages; returns how many it
+    placed.
 
-    A page it names (one of those shown) replaces the citation; 0 drops the row. A failed call, or a page that was
-    not shown, leaves the row marked Unverified. Returns the kept rows, how many were placed, and the dropped rows.
+    A page it names (one of those shown) replaces the citation. Any other answer leaves the row marked Unverified:
+    rows are never dropped, because on rfp-1.pdf both rows gpt-5-nano found on no page were in a table on a page it
+    was shown.
     """
     shown = {
         i: recheck_pages(r, result, "requirement_text") for i, r in enumerate(rows) if UNVERIFIED in r.get("notes", "")
@@ -534,19 +532,16 @@ def _second_look(
     results = _run_parallel(
         {i: lambda i=i: recheck(rows[i], shown[i]) for i in shown}, lambda _i: "recheck", max_parallel
     )
-    placed, dropped = 0, set()
+    placed = 0
     for i, (page, exc, _seconds, _resent) in results.items():
-        if exc is not None or (page and page not in shown[i]):
-            continue
-        if not page:
-            dropped.add(i)
+        if exc is not None or page not in shown[i]:
             continue
         row = rows[i]
         row["notes"] = "; ".join(n for n in row["notes"].split("; ") if n != UNVERIFIED)
         cite_page(row, page)
         add_note(row, f"Placed on p. {page} by a second check; the wording differs from the page.")
         placed += 1
-    return [r for i, r in enumerate(rows) if i not in dropped], placed, [rows[i] for i in sorted(dropped)]
+    return placed
 
 
 def _wording_force(text: str) -> tuple[str, str] | None:
@@ -562,14 +557,16 @@ def _wording_force(text: str) -> tuple[str, str] | None:
 def _check_force(rows: list[dict]) -> int:
     """Note each requirement whose Requirement Force disagrees with its wording; returns how many.
 
-    The label is not changed: wording alone misreads cases such as "The Department may reject...". Informational
-    rows are skipped, since they describe the issuer's process rather than an obligation on the bidder.
+    The label is not changed: wording alone misreads cases such as "The Department may reject...". Only Mandatory
+    and Advisory rows are checked. Informational rows describe the issuer's process, and a Conditional row's
+    condition is often in the text around it ("The vendor must support the LEA..." when the LEA opts in): on
+    rfp-1.pdf, 30 of 41 notes were on Conditional rows that were labelled correctly.
     """
     flagged = 0
     for row in rows:
         label = str(row.get("requirement_force", "")).strip()
         wording = _wording_force(str(row.get("requirement_text", "")))
-        if label in ("Mandatory", "Advisory", "Conditional") and wording and wording[0] != label:
+        if label in ("Mandatory", "Advisory") and wording and wording[0] != label:
             add_note(row, f'Force check: the wording ("{wording[1]}") reads as {wording[0]}, not {label}.')
             flagged += 1
     return flagged

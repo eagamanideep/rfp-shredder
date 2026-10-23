@@ -36,8 +36,8 @@ Two analysis modes:
      evaluation factors and the pages they come from (the scoring rubric), so requirements carry their Evaluation
      Link. The rows are merged in page order without repeats, each requirement's text is checked against the page it
      cites (the page is corrected, or the row is marked *Unverified* in Notes), and dates are normalised. Each
-     Unverified requirement gets a second look from `gpt-5-nano`, which places it on one of the nearby pages or finds
-     it on none; the row is then dropped and quoted in the warnings. A requirement whose wording suggests a different
+     Unverified requirement gets a second look from `gpt-5-nano`, which places it on one of the nearby pages (the
+     citation is corrected) or leaves it marked Unverified. A requirement whose wording suggests a different
      Requirement Force ("may" on a Mandatory row, "shall" on an Advisory one) gets a *Force check* note; the label
      is left as the model set it. A screening tab with no match in any chunk keeps the rule-based Not Found row.
   2. **The topical tabs**, one call per tab over the whole document.

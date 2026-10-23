@@ -589,7 +589,7 @@ def test_evaluation_rubric_without_pages_uses_the_cited_sections():
     assert shred_ai._evaluation_rubric(shred, result) == "4. EVALUATION\nTechnical 60 points"
 
 
-def test_second_look_places_drops_or_keeps_unverified_rows():
+def test_second_look_places_rows_or_leaves_them_unverified():
     from doc_to_excel.chunking import UNVERIFIED
 
     result = _pdf_like(["Cover", "Bids are due", "Vendors furnish proof of coverage", "Terms", "Signatures"])
@@ -613,13 +613,13 @@ def test_second_look_places_drops_or_keeps_unverified_rows():
             raise RuntimeError("boom")
         return next(page for start, page in answers.items() if row["requirement_text"].startswith(start))
 
-    kept, placed, dropped = shred_ai._second_look(rows, result, recheck, 8)
+    placed = shred_ai._second_look(rows, result, recheck, 8)
     assert "Verified elsewhere" not in shown  # only Unverified rows are checked
     assert {1, 2, 3} <= set(shown["Proof of insurance is needed"])  # the cited page and its neighbours
-    assert placed == 1 and [r["requirement_text"] for r in dropped] == ["A performance bond is needed"]
-    assert len(kept) == 4 and rows[2] not in kept
+    assert placed == 1 and len(rows) == 5  # no row is dropped
     assert rows[1]["source_location"] == "p. 3, Section 1"
     assert rows[1]["notes"].startswith("Placed on p. 3") and UNVERIFIED not in rows[1]["notes"]
+    assert rows[2]["notes"] == f"Model note; {UNVERIFIED}"  # found on no page: stays Unverified
     assert rows[3]["notes"] == rows[4]["notes"] == UNVERIFIED  # a failed call or an unshown page changes nothing
 
 
@@ -657,8 +657,11 @@ def test_force_check_notes_disagreements_without_changing_the_label():
             "requirement_force": "Conditional",
             "requirement_text": "Submit references if requested; they must be recent.",
         },
+        # A Conditional row's condition is often in the text around it, so it is not checked.
+        {"requirement_force": "Conditional", "requirement_text": "The vendor must support the LEA."},
     ]
     assert shred_ai._check_force(rows) == 3
+    assert "notes" not in rows[-1]
     assert "notes" not in rows[0] and "notes" not in rows[4] and "notes" not in rows[5] and "notes" not in rows[6]
     assert rows[1]["notes"] == 'Force check: the wording ("may") reads as Advisory, not Mandatory.'
     assert rows[2]["notes"] == 'x; Force check: the wording ("must") reads as Mandatory, not Advisory.'
