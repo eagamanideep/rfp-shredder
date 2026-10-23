@@ -99,7 +99,7 @@ def test_ai_shred_replaces_tabs_and_falls_back_per_group(monkeypatch):
         chunk_call = names in shred_ai.CHUNK_CALLS
         if chunk_call:
             assert "EXCERPT" in excerpt and "Sealed bids" in excerpt  # stage 1 reads the document in chunks
-            assert "EVALUATION FACTORS" in system
+            assert "EVALUATION FACTORS" in system and "EVALUATION RUBRIC" in system
         else:
             assert "PROCUREMENT DOCUMENT" in system and "Sealed bids" in system
         if "Show Stoppers" in names:
@@ -555,3 +555,112 @@ def test_stage3_context_goes_in_the_system_message_so_the_cache_covers_it():
     users = [kwargs["messages"][1]["content"] for kwargs in sent]
     assert systems[0] == systems[1] and systems[0].startswith("sys") and "R-001: Sign" in systems[0]
     assert users[0] != users[1] and not any("R-001" in u for u in users)
+
+
+def test_evaluation_rubric_shows_the_pages_the_factors_cite():
+    _, shred = rule_shred()
+    result = _pdf_like(["Cover page", "Technical approach 60 points. Price 40 points.", "Terms", "Scoring steps"])
+    shred.tabs["Evaluation Summary"] = [
+        {"criterion_factor": "Technical approach", "source_location": "p. 2, table"},
+        {"criterion_factor": "Price", "source_location": "p. 4, Evaluation"},
+    ]
+    rubric = shred_ai._evaluation_rubric(shred, result)
+    assert "=== Page 2 ===\nTechnical approach 60 points" in rubric and "=== Page 4 ===" in rubric
+    assert "Cover page" not in rubric and "=== Page 3 ===\nTerms" in rubric  # between two cited pages
+    assert shred_ai._evaluation_rubric(shred, result, limit=20).endswith("omitted]")
+    # Pages between cited evaluation pages are filled in when close together (the rubric sits between them).
+    pages = _pdf_like([f"page {i}" for i in range(1, 21)])
+    shred.tabs["Evaluation Summary"] = [{"source_location": f"p. {p}"} for p in (3, 6, 15)]
+    assert [p for p in range(1, 21) if f"=== Page {p} ===" in shred_ai._evaluation_rubric(shred, pages)] == [
+        3,
+        4,
+        5,
+        6,
+        15,
+    ]
+    shred.tabs["Evaluation Summary"] = []
+    assert shred_ai._evaluation_rubric(shred, result) == "(not found)"
+
+
+def test_evaluation_rubric_without_pages_uses_the_cited_sections():
+    _, shred = rule_shred()
+    result = _docx_like([(1, "4. EVALUATION", ["Technical 60 points"]), (1, "5. TERMS", ["Net 30"])])
+    shred.tabs["Evaluation Summary"] = [{"criterion_factor": "Technical", "source_location": "4. EVALUATION"}]
+    assert shred_ai._evaluation_rubric(shred, result) == "4. EVALUATION\nTechnical 60 points"
+
+
+def test_second_look_places_drops_or_keeps_unverified_rows():
+    from doc_to_excel.chunking import UNVERIFIED
+
+    result = _pdf_like(["Cover", "Bids are due", "Vendors furnish proof of coverage", "Terms", "Signatures"])
+    rows = [
+        {"requirement_text": "Verified elsewhere", "source_location": "p. 1", "notes": ""},
+        {"requirement_text": "Proof of insurance is needed", "source_location": "p. 2, Section 1", "notes": UNVERIFIED},
+        {
+            "requirement_text": "A performance bond is needed",
+            "source_location": "p. 4",
+            "notes": f"Model note; {UNVERIFIED}",
+        },
+        {"requirement_text": "Call fails", "source_location": "p. 5", "notes": UNVERIFIED},
+        {"requirement_text": "Model names a page it was not shown", "source_location": "p. 1", "notes": UNVERIFIED},
+    ]
+    answers = {"Proof": 3, "A performance": 0, "Model": 5}
+    shown = {}
+
+    def recheck(row, pages):
+        shown[row["requirement_text"]] = pages
+        if row["requirement_text"] == "Call fails":
+            raise RuntimeError("boom")
+        return next(page for start, page in answers.items() if row["requirement_text"].startswith(start))
+
+    kept, placed, dropped = shred_ai._second_look(rows, result, recheck, 8)
+    assert "Verified elsewhere" not in shown  # only Unverified rows are checked
+    assert {1, 2, 3} <= set(shown["Proof of insurance is needed"])  # the cited page and its neighbours
+    assert placed == 1 and [r["requirement_text"] for r in dropped] == ["A performance bond is needed"]
+    assert len(kept) == 4 and rows[2] not in kept
+    assert rows[1]["source_location"] == "p. 3, Section 1"
+    assert rows[1]["notes"].startswith("Placed on p. 3") and UNVERIFIED not in rows[1]["notes"]
+    assert rows[3]["notes"] == rows[4]["notes"] == UNVERIFIED  # a failed call or an unshown page changes nothing
+
+
+def test_recheck_call_uses_the_small_model_and_shows_the_pages():
+    import json
+
+    sent = []
+
+    def create(**kwargs):
+        sent.append(kwargs)
+        message = SimpleNamespace(content=json.dumps({"page": 3}), refusal=None)
+        return SimpleNamespace(usage=None, choices=[SimpleNamespace(finish_reason="stop", message=message)])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    row = {"requirement_text": "Proof of insurance", "source_location": "p. 2"}
+    config = AIConfig("sk-test", model="gpt-6-luna", reasoning_effort="medium")
+    assert shred_ai._recheck_call(client, config, row, [2, 3], ["one", "two", "three"], []) == 3
+    assert (sent[0]["model"], sent[0]["reasoning_effort"]) == ("gpt-5-nano", "low")
+    user = sent[0]["messages"][1]["content"]
+    assert "=== Page 2 ===\ntwo" in user and "=== Page 3 ===\nthree" in user and "one" not in user
+    assert config.model == "gpt-6-luna"  # the shred's own config is untouched
+
+
+def test_force_check_notes_disagreements_without_changing_the_label():
+    rows = [
+        {"requirement_force": "Mandatory", "requirement_text": "The vendor shall submit three copies."},
+        {"requirement_force": "Mandatory", "requirement_text": "Vendors may attend the site visit."},
+        {"requirement_force": "Advisory", "requirement_text": "Bids must be signed in blue ink.", "notes": "x"},
+        {"requirement_force": "Mandatory", "requirement_text": "If bonding is required, submit a bid bond."},
+        {"requirement_force": "Mandatory", "requirement_text": "Bids are due May 5, 2026 at 2:00 PM."},
+        {"requirement_force": "Mandatory", "requirement_text": "Report barriers that may affect delivery."},
+        {"requirement_force": "Mandatory", "requirement_text": "Payments may not exceed the Price Limitation."},
+        {"requirement_force": "Informational", "requirement_text": "The Department may reject any bid."},
+        {
+            "requirement_force": "Conditional",
+            "requirement_text": "Submit references if requested; they must be recent.",
+        },
+    ]
+    assert shred_ai._check_force(rows) == 3
+    assert "notes" not in rows[0] and "notes" not in rows[4] and "notes" not in rows[5] and "notes" not in rows[6]
+    assert rows[1]["notes"] == 'Force check: the wording ("may") reads as Advisory, not Mandatory.'
+    assert rows[2]["notes"] == 'x; Force check: the wording ("must") reads as Mandatory, not Advisory.'
+    assert "reads as Conditional" in rows[3]["notes"]
+    assert [r["requirement_force"] for r in rows][:4] == ["Mandatory", "Mandatory", "Advisory", "Mandatory"]

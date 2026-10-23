@@ -6,7 +6,9 @@ A. Stages 1 and 2 run together.
    1. Compliance Matrix, Key Dates and the screening tabs (Accessibility, Contract Vehicle, Supplier Diversity),
       extracted from page chunks. The rows are merged in page order, each requirement's citation is checked against
       the page text (see chunking.py), and a screening tab no chunk found anything for keeps its rule-based Not Found
-      row. Every chunk sees the document outline and the evaluation factors, so it can fill Evaluation Link.
+      row. A requirement the text check cannot place gets a second look from a small model, which places it on a
+      page or drops it; a requirement whose Requirement Force disagrees with its wording gets a note. Every chunk
+      sees the document outline, the evaluation factors and the pages they come from, so it can fill Evaluation Link.
    2. The topical tabs, one call per tab, over the whole document. They leave their requirement-ID columns empty,
       since the requirements do not exist yet.
 B. Stage 3 and the ID links run together.
@@ -38,11 +40,22 @@ import re
 import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from statistics import median
 
-from .chunking import Chunk, check_citations, merge_chunk_rows, plan_chunks
+from .chunking import (
+    UNVERIFIED,
+    Chunk,
+    add_note,
+    check_citations,
+    cite_page,
+    cited_pages,
+    merge_chunk_rows,
+    page_texts_with_tables,
+    plan_chunks,
+    recheck_pages,
+)
 from .extract import ExtractionResult
 from .shred import Shred, assign_ids
 from .shred_schema import SHOW_STOPPER_AREAS, TAB_BY_NAME, column_key
@@ -227,7 +240,8 @@ You are given ONE EXCERPT of the document (the pages named in the task), plus th
 - Text marked CONTEXT ONLY belongs to the next excerpt: read it to complete a row, never return rows that begin there.
 - Leave Related IDs empty; they are linked later.
 - Evaluation Link: when a row clearly supports one of the EVALUATION FACTORS below, name that factor and its weight;
-  otherwise leave it empty.
+  otherwise leave it empty. The EVALUATION RUBRIC (the pages the factors come from) says what each factor scores;
+  it is reference only, so never return rows from it unless those pages are also in your excerpt.
 - Screening tabs (Accessibility 508 ADA, Contract Vehicle Eligibility, Supplier Diversity Set-Aside): return rows only
   for matching content in the excerpt, and an empty array when there is none. Never return Not Found rows for them;
   absence across the whole document is recorded later.
@@ -254,6 +268,33 @@ STAGE2_RULE = (
     "The Compliance Matrix is built in parallel with this call: leave Requirement IDs / Related Requirement IDs "
     "empty; they are linked afterwards."
 )
+# Characters of the evaluation pages shown to every chunk call (in the system message, so it is cached). Pages
+# between two cited evaluation pages up to RUBRIC_GAP_PAGES apart are included: the rule-based shred finds the factor
+# table and the scoring steps, and the rubric often sits between them.
+EVALUATION_RUBRIC_CHARS = 15_000
+RUBRIC_GAP_PAGES = 5
+# Requirements the text check could not place get a second look from this model, whichever model runs the shred.
+RECHECK_MODEL = "gpt-5-nano"
+RECHECK_PROMPT = """You check where a requirement extracted from a procurement document appears in that document.
+You are given the requirement, the location another model cited for it, and the text of some pages. Return the number
+of the page that states the same requirement (the wording may differ: paraphrased, split across lines, or in a table),
+or 0 when none of the pages states it. Return 0 rather than guess.
+"""
+RECHECK_SCHEMA = {
+    "type": "object",
+    "properties": {"page": {"type": "integer"}},
+    "required": ["page"],
+    "additionalProperties": False,
+}
+# Wording that suggests a Requirement Force. "May not" is a prohibition; "may" after "that" / "which" / "who" is in a
+# subordinate clause ("barriers that may affect..."), and before a number it is the month. "When" is left out of
+# conditions, since "When submitting, vendors must..." does not make the obligation conditional.
+MANDATORY_WORDING = re.compile(r"\b(shall|must|required|may not)\b", re.I)
+ADVISORY_WORDING = re.compile(
+    r"\b((?<!\bthat )(?<!\bwhich )(?<!\bwho )may(?!\s+(\d|not\b))|should|encouraged|recommended|optional|preferred)\b",
+    re.I,
+)
+CONDITIONAL_WORDING = re.compile(r"\b(if|unless|in the event|provided that|where applicable)\b", re.I)
 SHOW_STOPPER_PARTS = 3
 # A call still running after STRAGGLER_FACTOR x the median time of its finished peers (and at least
 # STRAGGLER_MIN_SECONDS) is sent again. Peers must be at least half of their kind, and two or more.
@@ -354,7 +395,8 @@ def build_ai_shred(
     chunk_system = (
         f"{SYSTEM_PROMPT}{CHUNK_RULES}\nSource file name: {base.source_file}\n\n"
         f"===== DOCUMENT OUTLINE =====\n{_outline(result)}\n\n"
-        f"===== EVALUATION FACTORS =====\n{_evaluation_factors(base)}"
+        f"===== EVALUATION FACTORS =====\n{_evaluation_factors(base)}\n\n"
+        f"===== EVALUATION RUBRIC =====\n{_evaluation_rubric(base, result)}"
     )
 
     def run_chunk(names: tuple[str, ...], i: int) -> dict:
@@ -365,11 +407,16 @@ def build_ai_shred(
         opportunity = names == ("Key Dates",) and i == 0
         return _call(client, config, chunk_system, names, "", date, opportunity, usage=shred.usage, excerpt=excerpt)
 
+    page_texts = page_texts_with_tables(result)
+
+    def recheck(row: dict, pages: list[int]) -> int:
+        return _recheck_call(client, config, row, pages, page_texts, shred.usage)
+
     rule_show_stoppers = list(shred.tabs.get("Show Stoppers", []))
     report(0.05, f"Stages 1-2: requirements from {len(chunks)} chunks, and the topical tabs…")
     start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=2) as pool:
-        stage1 = pool.submit(_run_stage1, shred, result, chunks, run_chunk, config.max_parallel)
+        stage1 = pool.submit(_run_stage1, shred, result, chunks, run_chunk, recheck, config.max_parallel)
         stage2 = pool.submit(
             _run_groups,
             shred,
@@ -396,7 +443,9 @@ def build_ai_shred(
     return shred
 
 
-def _run_stage1(shred: Shred, result: ExtractionResult, chunks: list[Chunk], run_chunk, max_parallel: int) -> None:
+def _run_stage1(
+    shred: Shred, result: ExtractionResult, chunks: list[Chunk], run_chunk, recheck, max_parallel: int
+) -> None:
     """Extract the stage-1 tabs chunk by chunk in parallel, then merge and check them.
 
     A failed chunk keeps the rule-based rows that cite its pages, so the tab still covers the whole document.
@@ -407,7 +456,6 @@ def _run_stage1(shred: Shred, result: ExtractionResult, chunks: list[Chunk], run
     start = time.perf_counter()
     # Peers are the calls for the same tabs; a table-only chunk is shorter than the others, which is harmless.
     results = _run_parallel(jobs, lambda job: job[0], max_parallel)
-    elapsed = time.perf_counter() - start
 
     rows = {name: [[] for _ in chunks] for name in STAGE1_TABS}
     for (names, i), (data, exc, seconds, resent) in results.items():
@@ -426,7 +474,6 @@ def _run_stage1(shred: Shred, result: ExtractionResult, chunks: list[Chunk], run
                 r for r in rule_rows[name][1 if name == "Key Dates" else 0 :] if chunk.owns(r.get("source_location"))
             ]
         shred.warnings.append(f"AI failed for {label}, {chunk.label} ({exc}); that part uses rule-based rows.")
-    shred.timings.append(("AI stage 1 total (chunks run in parallel)", elapsed))
 
     for name in SCREENING_TABS:
         keys = TAB_BY_NAME[name].keys
@@ -439,10 +486,23 @@ def _run_stage1(shred: Shred, result: ExtractionResult, chunks: list[Chunk], run
     requirements = merge_chunk_rows(rows["Compliance Matrix"], lambda r: str(r.get("requirement_text", "")), chunks)
     checks = check_citations(requirements, result, "requirement_text")
     if checks["unverified"]:
+        recheck_start = time.perf_counter()
+        requirements, placed, dropped = _second_look(requirements, result, recheck, max_parallel)
+        shred.timings.append(("AI stage 1 · Citation second look", time.perf_counter() - recheck_start))
+        left = checks["unverified"] - placed - len(dropped)
         shred.warnings.append(
-            f"{checks['unverified']} of {checks['checked']} requirements could not be found on their cited page; "
-            "they are marked Unverified in Notes."
+            f"{checks['unverified']} of {checks['checked']} requirements could not be found on their cited page by "
+            f"the text check. A second check ({RECHECK_MODEL}) placed {placed} on a page and dropped {len(dropped)} "
+            "that none of the nearby pages states"
+            + "".join(f'; "{str(r.get("requirement_text", ""))[:80]}"' for r in dropped)
+            + (f". {left} stay marked Unverified in Notes." if left else ".")
         )
+    flagged = _check_force(requirements)
+    if flagged:
+        shred.warnings.append(
+            f'{flagged} requirements have a Requirement Force their wording does not match; see "Force check" in Notes.'
+        )
+    shred.timings.append(("AI stage 1 total (chunks run in parallel)", time.perf_counter() - start))
     shred.tabs["Compliance Matrix"] = requirements
     dates = merge_chunk_rows(
         rows["Key Dates"], lambda r: " ".join(str(r.get(k, "")) for k in ("date_type", "date", "time")), chunks
@@ -458,6 +518,61 @@ def _is_finding(row: dict, keys: tuple[str, ...]) -> bool:
     """A screening row that reports something found, not an absence ("Not Found") or an empty row."""
     lead = " ".join(str(row.get(k) or "") for k in keys[:2]).strip()
     return bool(lead) and "not found" not in f"{lead} {row.get('notes') or ''}".lower()
+
+
+def _second_look(
+    rows: list[dict], result: ExtractionResult, recheck, max_parallel: int
+) -> tuple[list[dict], int, list[dict]]:
+    """Ask a small model where each Unverified requirement is, among its cited and nearby pages.
+
+    A page it names (one of those shown) replaces the citation; 0 drops the row. A failed call, or a page that was
+    not shown, leaves the row marked Unverified. Returns the kept rows, how many were placed, and the dropped rows.
+    """
+    shown = {
+        i: recheck_pages(r, result, "requirement_text") for i, r in enumerate(rows) if UNVERIFIED in r.get("notes", "")
+    }
+    results = _run_parallel(
+        {i: lambda i=i: recheck(rows[i], shown[i]) for i in shown}, lambda _i: "recheck", max_parallel
+    )
+    placed, dropped = 0, set()
+    for i, (page, exc, _seconds, _resent) in results.items():
+        if exc is not None or (page and page not in shown[i]):
+            continue
+        if not page:
+            dropped.add(i)
+            continue
+        row = rows[i]
+        row["notes"] = "; ".join(n for n in row["notes"].split("; ") if n != UNVERIFIED)
+        cite_page(row, page)
+        add_note(row, f"Placed on p. {page} by a second check; the wording differs from the page.")
+        placed += 1
+    return [r for i, r in enumerate(rows) if i not in dropped], placed, [rows[i] for i in sorted(dropped)]
+
+
+def _wording_force(text: str) -> tuple[str, str] | None:
+    """The Requirement Force a requirement's wording suggests, and the word that suggests it; None if it has none."""
+    force = MANDATORY_WORDING.search(text) or ADVISORY_WORDING.search(text)
+    if not force:
+        return None
+    if condition := CONDITIONAL_WORDING.search(text):
+        return "Conditional", condition.group(0)
+    return ("Mandatory" if MANDATORY_WORDING.search(text) else "Advisory"), force.group(0)
+
+
+def _check_force(rows: list[dict]) -> int:
+    """Note each requirement whose Requirement Force disagrees with its wording; returns how many.
+
+    The label is not changed: wording alone misreads cases such as "The Department may reject...". Informational
+    rows are skipped, since they describe the issuer's process rather than an obligation on the bidder.
+    """
+    flagged = 0
+    for row in rows:
+        label = str(row.get("requirement_force", "")).strip()
+        wording = _wording_force(str(row.get("requirement_text", "")))
+        if label in ("Mandatory", "Advisory", "Conditional") and wording and wording[0] != label:
+            add_note(row, f'Force check: the wording ("{wording[1]}") reads as {wording[0]}, not {label}.')
+            flagged += 1
+    return flagged
 
 
 DATE_FORMATS = ("%b %d, %Y", "%B %d, %Y", "%b. %d, %Y", "%Y-%m-%d", "%m/%d/%Y")
@@ -515,6 +630,31 @@ def _evaluation_factors(shred: Shred) -> str:
         if r.get("criterion_factor")
     ]
     return "\n".join(lines) or "(none detected; leave Evaluation Link empty unless the excerpt names a factor)"
+
+
+def _evaluation_rubric(shred: Shred, result: ExtractionResult, limit: int = EVALUATION_RUBRIC_CHARS) -> str:
+    """The text the rule-based evaluation factors were found in (their pages, or sections without pages), capped."""
+    locations = [str(r.get("source_location", "")) for r in shred.tabs.get("Evaluation Summary", [])]
+    if result.file_type == "pdf":
+        texts = page_texts_with_tables(result)
+        cited = sorted({p for loc in locations for p in cited_pages(loc, len(texts))})
+        pages = [
+            p
+            for a, b in zip(cited, cited[1:] + cited[-1:])
+            for p in (range(a, b) if b - a <= RUBRIC_GAP_PAGES else [a])
+        ]
+        pages = sorted(set(pages + cited[-1:]))
+        parts = [f"=== Page {p} ===\n{texts[p - 1]}" for p in pages]
+    else:
+        parts = [
+            f"{s.heading}\n{s.content}"
+            for s in result.sections
+            if s.heading and any(s.heading[:67] in loc for loc in locations)
+        ]
+    text = "\n\n".join(parts)
+    if not text:
+        return "(not found)"
+    return text if len(text) <= limit else text[:limit] + "\n[…rest of the evaluation pages omitted]"
 
 
 def _apply_opportunity(shred: Shred, opp: dict) -> None:
@@ -652,6 +792,16 @@ def _link_call(client, config: AIConfig, shred: Shred, tab: str) -> dict[str, st
     else:
         raise ShredAIError("the link call returned no requirement IDs for any row")
     return {row_id: ", ".join(dict.fromkeys(ids[:6])) for row_id, ids in links.items()}
+
+
+def _recheck_call(client, config: AIConfig, row: dict, pages: list[int], page_texts: list[str], usage) -> int:
+    """The page (one of `pages`) that states the requirement, or 0, from RECHECK_MODEL."""
+    user = f"Requirement: {row.get('requirement_text', '')}\nCited: {row.get('source_location', '')}\n\n" + "\n\n".join(
+        f"=== Page {p} ===\n{page_texts[p - 1]}" for p in pages
+    )
+    small = replace(config, model=RECHECK_MODEL, reasoning_effort="low")
+    data = _request(client, small, RECHECK_PROMPT, user, "requirement_page", RECHECK_SCHEMA, "Citation recheck", usage)
+    return int(data["page"])
 
 
 def _apply_links(shred: Shred, tab: str, links: dict[str, str]) -> None:

@@ -192,21 +192,41 @@ def cited_pages(location, page_count: int) -> list[int]:
     return pages
 
 
+UNVERIFIED = "Unverified: text not found on the cited page."
+
+
+def _page_words(result: ExtractionResult) -> list[set[str]]:
+    return [set(content_words(p)) for p in page_texts_with_tables(result)]
+
+
+def _share(words: list[str], pages, page_words: list[set[str]]) -> float:
+    on = set().union(*(page_words[p - 1] for p in pages)) if pages else set()
+    return sum(w in on for w in words) / len(words)
+
+
+def add_note(row: dict, note: str) -> None:
+    row["notes"] = "; ".join(n for n in (row.get("notes", ""), note) if n)
+
+
+def cite_page(row: dict, page: int) -> None:
+    """Replace the first page reference in Source Location with `page` (or put the page in front)."""
+    location = row.get("source_location", "")
+    row["source_location"] = (
+        PAGE_REF.sub(f"p. {page}", location, count=1) if PAGE_REF.search(location) else f"p. {page}, {location}"
+    )
+
+
 def check_citations(rows: list[dict], result: ExtractionResult, text_key: str) -> dict[str, int]:
     """Check each row's text against the page it cites; fix the page or flag the row.
 
     Text found on the cited page(s): left alone. Found on another page: the first page reference in Source Location
-    is replaced with that page and Notes say so. Found nowhere: Notes say the row is unverified. Returns counts.
-    Only PDFs have pages to check.
+    is replaced with that page and Notes say so. Found nowhere: Notes say the row is unverified (UNVERIFIED). Returns
+    counts. Only PDFs have pages to check.
     """
     counts = {"checked": 0, "corrected": 0, "unverified": 0}
     if result.file_type != "pdf":
         return counts
-    page_words = [set(content_words(p)) for p in page_texts_with_tables(result)]
-
-    def share(words: list[str], pages) -> float:
-        on = set().union(*(page_words[p - 1] for p in pages)) if pages else set()
-        return sum(w in on for w in words) / len(words)
+    page_words = _page_words(result)
 
     for row in rows:
         words = content_words(row.get(text_key))
@@ -214,18 +234,26 @@ def check_citations(rows: list[dict], result: ExtractionResult, text_key: str) -
             continue
         counts["checked"] += 1
         cited = cited_pages(row.get("source_location"), len(page_words))
-        if cited and share(words, cited) >= FOUND_ON_PAGE:
+        if cited and _share(words, cited, page_words) >= FOUND_ON_PAGE:
             continue
-        best = max(range(1, len(page_words) + 1), key=lambda p: share(words, [p]))
-        notes = row.get("notes", "")
-        if share(words, [best]) >= FOUND_ON_PAGE:
-            location = row.get("source_location", "")
-            row["source_location"] = (
-                PAGE_REF.sub(f"p. {best}", location, count=1) if PAGE_REF.search(location) else f"p. {best}, {location}"
-            )
-            row["notes"] = "; ".join(n for n in (notes, f"Page corrected to p. {best} by text check.") if n)
+        best = max(range(1, len(page_words) + 1), key=lambda p: _share(words, [p], page_words))
+        if _share(words, [best], page_words) >= FOUND_ON_PAGE:
+            cite_page(row, best)
+            add_note(row, f"Page corrected to p. {best} by text check.")
             counts["corrected"] += 1
         else:
-            row["notes"] = "; ".join(n for n in (notes, "Unverified: text not found on the cited page.") if n)
+            add_note(row, UNVERIFIED)
             counts["unverified"] += 1
     return counts
+
+
+def recheck_pages(row: dict, result: ExtractionResult, text_key: str) -> list[int]:
+    """Pages to show a second check of an unverified row: the cited pages and their neighbours, and the page with the
+    most of the row's words (the text may be paraphrased, or cited to the wrong place altogether)."""
+    page_words = _page_words(result)
+    n = len(page_words)
+    words = content_words(row.get(text_key))
+    pages = {p + d for p in cited_pages(row.get("source_location"), n) for d in (-1, 0, 1) if 1 <= p + d <= n}
+    if words and n:
+        pages.add(max(range(1, n + 1), key=lambda p: _share(words, [p], page_words)))
+    return sorted(pages)

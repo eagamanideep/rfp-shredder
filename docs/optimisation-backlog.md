@@ -6,7 +6,8 @@ code, and how to check it. The numbers come from benchmarks on that one RFP (Oct
 estimates as starting points.
 
 **Status (Oct 23, 2026):** items 1, 3 and 11 are done; see [Done](#done) for what was measured. Item 1 turned out
-not to pay, but measuring it found a larger cache fix in stage 3.
+not to pay, but measuring it found a larger cache fix in stage 3. Items 7, 8 and 9 are built and tested offline, but
+not yet measured in a live run; see [Built, not yet measured](#built-not-yet-measured).
 
 ## Where the time and money go now
 
@@ -26,7 +27,8 @@ already cached.
 ## Recommended order
 
 1. ~~**No risk to quality:** cache warm-up (1), straggler resend (3), chunking for Word documents (11).~~ Done.
-2. **Quality:** scoring rubric in chunk calls (7), second look at Unverified rows (8).
+2. ~~**Quality:** scoring rubric in chunk calls (7), second look at Unverified rows (8).~~ Built, with the Force
+   check (9); to be measured.
 3. **Needs careful measuring:** shorter cells (2).
 4. **Needs a person:** the hand-checked answer key (10).
 
@@ -157,3 +159,27 @@ tables (which have no position in a Word document's text) form a last chunk, and
 missing from the Compliance Matrix call altogether. Rows cite section headings; a failed chunk falls back to the
 rule-based rows that cite its headings; the page check is skipped. On a Word copy of `rfp-1.pdf` the run took less
 than half the time and found 70% more requirements, at the same recall.
+
+## Built, not yet measured
+
+Offline tests cover all three. A live run on `rfp-1.pdf` with `gpt-6-luna` (~$0.10) is still needed to measure
+Evaluation Link coverage, grounding, recall, and the time the second look adds to stage 1.
+
+**7. Rubric in chunk calls.** `_evaluation_rubric` adds the pages the rule-based Evaluation Summary cites to the chunk
+system prompt, filling gaps of up to 5 pages between them, capped at 15,000 characters. On `rfp-1.pdf` the rule-based
+rows cite pp. 19 and 24; with the gap filled in, the rubric on pp. 20–23 is included (12,924 characters, ~3K tokens,
+cached after the first call). Chunk calls are told the rubric is reference only.
+*Check:* Evaluation Link coverage on proposal-content pages (36% before).
+
+**8. Second look at Unverified rows.** `_second_look` sends each Unverified requirement to `gpt-5-nano` (low effort),
+whatever model runs the shred, with its cited pages, their neighbours, and the page that shares the most words with
+it. A page it names among those replaces the citation, and Notes say so; 0 drops the row, and the warning quotes it.
+A failed call or a page it was not shown leaves the row Unverified. It runs at the end of stage 1, so it adds to
+phase A: stage 1 was already the longer half (65–74 s against 40–55 s for stage 2).
+*Check:* grounding, recall, the number of drops (should be rare), and the "Citation second look" time.
+
+**9. Requirement Force check.** `_check_force` notes rows whose wording suggests another Force ("shall", "must",
+"required", "may not" = Mandatory; "may", "should" = Advisory; "if", "unless", "in the event" = Conditional, when
+the row also has one of the others). The label is not changed, and Informational rows are skipped. On earlier
+workbooks it flags 7 of 158 `gpt-6-luna` rows and 3 of 70 `gpt-5.6-luna` rows. A "may" in a subordinate clause
+("barriers that may affect") or before a date is not counted.
